@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::app::{App, Output, now, output};
 use crate::cache;
-use crate::config::{self, Settings};
+use crate::config::{self, Source};
 use crate::error::{AppError, Result};
 use crate::image;
 use crate::pages;
@@ -31,8 +31,6 @@ pub const API_SPACING: Duration = Duration::from_secs(2);
 pub const RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 pub const RATE_LIMIT_RETRIES: u32 = 3;
 pub const NETWORK_WAIT: Duration = Duration::from_secs(5);
-/// `syncs.json` is rewritten at most this often while downloading thumbnails.
-pub const WRITE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Thumbnail failures that only skip that thumbnail.
 const SKIPPABLE: [&str; 5] = ["http", "invalid_image", "too_large", "network", "timeout"];
@@ -135,6 +133,16 @@ pub fn cancel(paths: &Paths) -> Result<Output> {
     Ok(output(json!({"running": running})))
 }
 
+/// The query a sync walks: the whole category, both styles and any color, so changing the
+/// filters never makes a finished sync look stale. Every filtered view is a subset of it.
+pub fn query_for(source: &Source) -> Query {
+    Query {
+        tag: source.tag,
+        categories: "110",
+        color: None,
+    }
+}
+
 /// `sync <sourceKey>`.
 pub fn sync(app: &App, key: &str) -> Result<Output> {
     let sources = config::load_sources(&app.paths.config_file)?;
@@ -143,8 +151,7 @@ pub fn sync(app: &App, key: &str) -> Result<Output> {
         .iter()
         .find(|src| src.key == key)
         .ok_or_else(|| AppError::usage(format!("Unknown source: {key}")))?;
-    let settings = Settings::load(&app.paths.state("settings.json"), &sources)?;
-    let query = app.query(source, &settings, app.color(&settings));
+    let query = query_for(source);
 
     let _lock = state::acquire_named_lock(&app.paths.state_dir, SYNC_LOCK, app.sync_lock_wait)?;
     let _ = fs::remove_file(app.paths.state(CANCEL_FILE));
@@ -176,7 +183,6 @@ pub fn sync(app: &App, key: &str) -> Result<Output> {
             updated_at: started,
         },
         last_api: None,
-        last_write: Duration::ZERO,
     };
     let result = run.write().and_then(|()| run.walk(&query));
     cache::evict_thumbs(&app.paths.thumbs_dir(), cache::THUMBS_MAX_BYTES);
@@ -203,7 +209,6 @@ struct Run<'a> {
     path: PathBuf,
     state: SyncState,
     last_api: Option<Duration>,
-    last_write: Duration,
 }
 
 impl Run<'_> {
@@ -215,23 +220,21 @@ impl Run<'_> {
             self.state.page = page;
             self.state.page_done = self.state.done;
             self.state.page_skipped = self.state.skipped;
+            if self.take_cancel() {
+                return Ok("canceled");
+            }
             let result = self.search(query, page)?;
             // Synced sources stay browsable while Wallhaven is down.
             let _ = pages::save(&self.app.paths.pages_dir(), &query.key(), page, &result);
             self.state.total = Some(result.total);
             self.state.last_page = Some(result.last_page);
-            for item in &result.items {
-                if self.take_cancel() {
-                    return Ok("canceled");
-                }
-                // Already cached thumbnails return immediately and count as done.
-                match image::ensure_thumb(&*self.app.transport, item, &thumbs) {
+            // A page's thumbnails download several at a time, like browse; cached ones return
+            // at once and count as done.
+            for result in image::ensure_thumbs(&*self.app.transport, &result.items, &thumbs) {
+                match result {
                     Ok(_) => self.state.done += 1,
                     Err(e) if SKIPPABLE.contains(&e.code) => self.state.skipped += 1,
                     Err(e) => return Err(e),
-                }
-                if self.app.clock.elapsed().saturating_sub(self.last_write) >= WRITE_INTERVAL {
-                    self.write()?;
                 }
             }
             if page >= result.last_page {
@@ -286,7 +289,6 @@ impl Run<'_> {
     /// Rewrites this query's record; only a sync holding the lock writes `syncs.json`.
     fn write(&mut self) -> Result<()> {
         self.state.updated_at = now();
-        self.last_write = self.app.clock.elapsed();
         let mut syncs = state::read_json::<Syncs>(&self.path)?;
         syncs.version = 1;
         syncs
@@ -306,12 +308,13 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    const KEY: &str = "tag:711|cat:100|color:none";
+    // Sync walks the whole category even though the test settings show General only (cat 100).
+    const KEY: &str = "tag:711|cat:110|color:none";
 
     fn page_url(page: u64) -> String {
         Query {
             tag: 711,
-            categories: "100",
+            categories: "110",
             color: None,
         }
         .url(page)
@@ -435,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_stops_before_next_thumbnail() {
+    fn cancel_stops_before_the_next_page() {
         let (mut app, _) = sync_app("sync-cancel", FakeTransport::default());
         fs::create_dir_all(&app.paths.state_dir).unwrap();
         app.transport = Box::new(CancelAt {
@@ -444,11 +447,13 @@ mod tests {
             cancel: app.paths.state(CANCEL_FILE),
         });
         let out = run(&app, &["sync", "landscape"]).unwrap();
+        // The page in flight finishes; the next one is never requested.
         assert_eq!(out["sync"]["state"], "canceled");
-        assert_eq!(out["sync"]["done"], 1);
+        assert_eq!(out["sync"]["done"], 2);
         assert!(!app.paths.state(CANCEL_FILE).exists());
-        assert!(!app.paths.thumbs_dir().join("aa2.png").exists());
-        assert_eq!(sync_file(&app).state, "canceled");
+        assert!(!app.paths.thumbs_dir().join("bb1.png").exists());
+        let record = sync_file(&app);
+        assert_eq!((record.state.as_str(), record.page), ("canceled", 2));
     }
 
     #[test]

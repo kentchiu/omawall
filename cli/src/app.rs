@@ -243,7 +243,8 @@ impl App {
                     "key": src.key, "label": src.label, "tag": src.tag,
                     "selected": s.settings.is_selected(&src.key),
                     "total": s.status.totals.get(&key),
-                    "sync": sync::source_view(&syncs, &key),
+                    // A sync covers the whole category, whatever the filters.
+                    "sync": sync::source_view(&syncs, &sync::query_for(src).key()),
                 })
             })
             .collect();
