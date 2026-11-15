@@ -35,6 +35,8 @@ Panel {
   property string browseError: ""
   // Pages of the current source already in the grid, by page number.
   property var loadedPages: ({})
+  // The card the keyboard acts on.
+  property int selectedIndex: 0
   readonly property bool browseBusy: browseProc.running
   // Repeaters rebuild every delegate when handed a new array; these change only when their content does.
   property var sources: []
@@ -78,19 +80,20 @@ Panel {
     browseLoaded = 0
     browseError = ""
     loadedPages = ({})
+    selectedIndex = 0
     pumpBrowse()
   }
   function pumpBrowse() {
     if (!browseOpen || browseSource === "" || browseProc.running || browseError !== "") return
-    var cols = Math.max(1, Math.floor(grid.width / grid.cellWidth))
-    var page = Model.nextPage(grid.contentY, grid.originY, grid.height, cols, grid.cellHeight,
+    var page = Model.nextPage(grid.contentY, grid.originY, grid.height, gridColumns(), grid.cellHeight,
                               browseModel.count, browseLastPage, loadedPages)
     if (page > 0) browseProc.start(browseSource, page)
   }
   function acceptPage(result) {
     var items = Array.isArray(result.items) ? result.items : []
     var start = (result.page - 1) * Model.PER_PAGE
-    if (browseLastPage === 0) {
+    var first = browseLastPage === 0
+    if (first) {
       browseTotal = result.total
       browseLastPage = result.lastPage
       var blanks = []
@@ -101,6 +104,8 @@ Panel {
       var row = Model.browseRow(items[k])
       if (start + k < browseModel.count) browseModel.set(start + k, row)
       else browseModel.append(row)
+      // Start the keyboard on the wallpaper in use when it is on the first page.
+      if (first && row.current) selectedIndex = start + k
     }
     // Wallhaven's total drifts a little; the last page settles the real length.
     var end = start + items.length
@@ -117,6 +122,57 @@ Panel {
     Qt.callLater(function() { browseScope.forceActiveFocus() })
   }
   function closeBrowse() { browseOpen = false }
+  function gridColumns() { return Math.max(1, Math.floor(grid.width / grid.cellWidth)) }
+  function selectMove(move) {
+    var rows = Math.max(1, Math.floor(grid.height / grid.cellHeight))
+    selectedIndex = Model.moveIndex(selectedIndex, move, gridColumns(), browseModel.count, rows)
+    revealSelected()
+  }
+  // Glide just far enough to bring the selected card fully into view.
+  function revealSelected() {
+    var top = grid.originY + Math.floor(selectedIndex / gridColumns()) * grid.cellHeight
+    var from = wheelGlide.running ? grid.glideTarget : grid.contentY
+    var target = from
+    if (top < from) target = top
+    else if (top + grid.cellHeight > from + grid.height) target = top + grid.cellHeight - grid.height
+    var bottom = grid.originY + Math.max(0, grid.contentHeight - grid.height)
+    target = Math.max(grid.originY, Math.min(bottom, target))
+    if (target === from) return
+    grid.glideTarget = target
+    if (!wheelGlide.running) wheelGlide.start()
+  }
+  function selectedWallpaper() {
+    if (selectedIndex < 0 || selectedIndex >= browseModel.count) return ""
+    return browseModel.get(selectedIndex).wid
+  }
+  function switchTab(step) {
+    var tabs = tabList
+    if (!tabs.length) return
+    var at = 0
+    for (var i = 0; i < tabs.length; i++) if (tabs[i].key === browseSource) at = i
+    loadBrowse(tabs[(at + step + tabs.length) % tabs.length].key)
+  }
+  function browseKey(event) {
+    switch (event.key) {
+    case Qt.Key_Left: case Qt.Key_H: selectMove("left"); break
+    case Qt.Key_Right: case Qt.Key_L: selectMove("right"); break
+    case Qt.Key_Up: case Qt.Key_K: selectMove("up"); break
+    case Qt.Key_Down: case Qt.Key_J: selectMove("down"); break
+    case Qt.Key_PageUp: selectMove("pageUp"); break
+    case Qt.Key_PageDown: selectMove("pageDown"); break
+    case Qt.Key_Home: selectMove("home"); break
+    case Qt.Key_End: selectMove("end"); break
+    case Qt.Key_G: selectMove(event.modifiers & Qt.ShiftModifier ? "end" : "home"); break
+    case Qt.Key_Return: case Qt.Key_Enter: if (selectedWallpaper()) applyFromBrowse(selectedWallpaper()); break
+    case Qt.Key_O: openUrl(Model.wallpaperUrl(selectedWallpaper())); break
+    case Qt.Key_Tab: switchTab(1); break
+    case Qt.Key_Backtab: switchTab(-1); break
+    case Qt.Key_S: syncAction(); break
+    case Qt.Key_Escape: case Qt.Key_Q: closeBrowse(); break
+    default: event.accepted = false; return
+    }
+    event.accepted = true
+  }
   function applyFromBrowse(id) {
     closeBrowse()
     runAction(["apply", id])
@@ -129,6 +185,13 @@ Panel {
   }
 
   onOpenedChanged: if (opened) refreshStatus()
+  // `omarchy-shell kent.omawall.browse toggle` opens the browse view without the panel.
+  ShellIpc {
+    target: "kent.omawall.browse"
+    function toggle(): void { if (root.browseOpen) root.closeBrowse(); else root.openBrowse() }
+    function open(): void { if (!root.browseOpen) root.openBrowse() }
+    function close(): void { root.closeBrowse() }
+  }
   onStatusChanged: {
     var list = status && status.sources ? status.sources : []
     if (JSON.stringify(list) !== JSON.stringify(sources)) sources = list
@@ -494,7 +557,7 @@ Panel {
         id: browseScope
         anchors.fill: parent
         focus: true
-        Keys.onEscapePressed: root.closeBrowse()
+        Keys.onPressed: function(event) { root.browseKey(event) }
 
         ColumnLayout {
           id: browseColumn
@@ -515,7 +578,7 @@ Panel {
                 Layout.fillWidth: true
               }
             }
-            ActionButton { text: "Close"; Layout.fillWidth: false; onClicked: root.closeBrowse() }
+            ActionButton { text: "Close"; Layout.fillWidth: false; focusable: false; onClicked: root.closeBrowse() }
           }
 
           Flow {
@@ -527,6 +590,7 @@ Panel {
                 required property var modelData
                 text: (modelData.selected ? "• " : "") + modelData.label + "  " + Model.formatCount(modelData.count)
                 selected: root.browseSource === modelData.key
+                focusable: false
                 onClicked: root.loadBrowse(modelData.key)
               }
             }
@@ -558,8 +622,14 @@ Panel {
             boundsBehavior: Flickable.StopAtBounds
             // Build cards and decode thumbnails a screen ahead, so they are ready before they scroll in.
             cacheBuffer: Math.max(0, Math.round(height))
-            // Thousands of cards would shrink the handle to a sliver; keep it grabbable.
-            QQC.ScrollBar.vertical: QQC.ScrollBar { minimumSize: 0.05; onPressedChanged: if (pressed) wheelGlide.stop() }
+            // Always shown: the wheel glide sets contentY directly, which never marks the view as moving,
+            // so an as-needed bar would stay hidden. Thousands of cards would shrink the handle to a
+            // sliver; keep it grabbable.
+            QQC.ScrollBar.vertical: QQC.ScrollBar {
+              policy: QQC.ScrollBar.AlwaysOn
+              minimumSize: 0.05
+              onPressedChanged: if (pressed) wheelGlide.stop()
+            }
             // Fetch the pages under the view at most every 150 ms while it moves.
             onContentYChanged: if (!pumpTimer.running) pumpTimer.start()
             onHeightChanged: if (!pumpTimer.running) pumpTimer.start()
@@ -613,6 +683,8 @@ Panel {
               required property bool seen
               required property bool fav
               required property bool current
+              required property int index
+              readonly property bool picked: index === root.selectedIndex
               width: grid.cellWidth
               height: grid.cellHeight
 
@@ -621,8 +693,9 @@ Panel {
                 width: 432
                 height: 243 + Style.space(28)
                 color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.05)
-                border.width: card.current || mouse.containsMouse ? 2 : 0
-                border.color: card.current ? Color.accent : Qt.darker(Color.foreground, 1.6)
+                // Keyboard selection outranks the wallpaper in use and the hover.
+                border.width: card.picked ? 3 : (card.current || mouse.containsMouse ? 2 : 0)
+                border.color: card.picked ? Color.foreground : (card.current ? Color.accent : Qt.darker(Color.foreground, 1.6))
 
                 SizedImage {
                   x: 0
@@ -709,6 +782,12 @@ Panel {
               onClicked: Util.execArgv(["xdg-open", root.thumbsDir])
             }
             Item { Layout.fillWidth: true }
+            Label {
+              text: "←↑↓→ / hjkl move · Enter apply · o open · Tab category · s sync · Esc close"
+              color: Qt.darker(Color.foreground, 1.6)
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.NoWrap
+            }
           }
         }
       }

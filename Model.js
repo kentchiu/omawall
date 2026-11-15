@@ -281,3 +281,25 @@ function nextPage(contentY, originY, height, cols, cellHeight, count, lastPage, 
     if (order[i] >= 1 && order[i] <= lastPage && !loaded[order[i]]) return order[i]
   return 0
 }
+
+// Keyboard selection in the browse grid. `move` is left, right, up, down, pageUp, pageDown,
+// home or end; `pageRows` is how many rows fit on screen. Left and right run across rows;
+// down from the last full row lands on the last card.
+function moveIndex(index, move, cols, count, pageRows) {
+  if (count <= 0) return 0
+  cols = Math.max(1, cols)
+  var i = Math.max(0, Math.min(count - 1, index))
+  var page = Math.max(1, pageRows) * cols
+  var lastRow = Math.floor((count - 1) / cols)
+  switch (move) {
+  case "left": return Math.max(0, i - 1)
+  case "right": return Math.min(count - 1, i + 1)
+  case "up": return i - cols >= 0 ? i - cols : i
+  case "down": return i + cols < count ? i + cols : (Math.floor(i / cols) < lastRow ? count - 1 : i)
+  case "pageUp": return Math.max(0, i - page)
+  case "pageDown": return Math.min(count - 1, i + page)
+  case "home": return 0
+  case "end": return count - 1
+  }
+  return i
+}

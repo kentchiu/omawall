@@ -37,10 +37,24 @@ optional timer. No API key is needed.
    ```
 3. Make sure `omarchy.background` is not listed in `disabledPlugins` in `~/.config/omarchy/shell.json`;
    it draws still wallpapers.
-4. Optional: add a key binding, e.g. in `~/.config/hypr/bindings.lua`:
+4. Optional: add key bindings, e.g. in `~/.config/hypr/bindings.lua`:
    ```lua
    o.bind("SUPER + ALT + W", "Next wallpaper (omawall)", "~/.local/bin/omawall next")
+   o.bind("SUPER + ALT + SHIFT + W", "Browse wallpapers (omawall)", "omarchy-shell -q kent.omawall.browse toggle")
    ```
+
+## Keyboard (browse view)
+
+| Key | Action |
+|---|---|
+| `←↑↓→` or `h j k l` | Move the selection |
+| `PageUp` / `PageDown` | Move one screen |
+| `Home` / `End` (or `g` / `G`) | First / last wallpaper |
+| `Enter` | Apply the selected wallpaper |
+| `o` | Open its Wallhaven page |
+| `Tab` / `Shift+Tab` | Next / previous category |
+| `s` | Start or cancel syncing this category |
+| `Esc` / `q` | Close |
 
 ## Update
 

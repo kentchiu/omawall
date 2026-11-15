@@ -171,3 +171,23 @@ test('pages load where the grid is, then below, then above', () => {
   // Never past the last page.
   assert.equal(M.nextPage(1e9, 0, 600, 5, 200, 4991, 208, {}), 208);
 });
+
+test('keyboard moves the selection across the grid', () => {
+  // 5 columns, 23 cards: the last row holds cards 20–22; 3 rows fit on screen.
+  const m = (i, move) => M.moveIndex(i, move, 5, 23, 3);
+  assert.equal(m(0, 'left'), 0);
+  assert.equal(m(5, 'left'), 4);                // wraps to the previous row
+  assert.equal(m(4, 'right'), 5);
+  assert.equal(m(22, 'right'), 22);
+  assert.equal(m(2, 'up'), 2);
+  assert.equal(m(7, 'up'), 2);
+  assert.equal(m(7, 'down'), 12);
+  assert.equal(m(18, 'down'), 22);              // no card below: the last one
+  assert.equal(m(21, 'down'), 21);              // already on the last row
+  assert.equal(m(1, 'pageDown'), 16);
+  assert.equal(m(20, 'pageDown'), 22);
+  assert.equal(m(16, 'pageUp'), 1);
+  assert.equal(m(9, 'home'), 0);
+  assert.equal(m(9, 'end'), 22);
+  assert.equal(M.moveIndex(3, 'down', 5, 0, 3), 0);   // nothing loaded yet
+});
