@@ -13,7 +13,8 @@ var Icons = {
   timer: "\uDB81\uDD1B",       // md-timer_outline
   sync: "\uDB81\uDCE6",        // md-sync
   syncAlert: "\uDB81\uDCE7",   // md-sync_alert
-  synced: "\uDB81\uDDE1"       // md-check_circle_outline
+  synced: "\uDB81\uDDE1",      // md-check_circle_outline
+  folder: "\uDB80\uDE4F"       // md-folder_image
 }
 
 var MIN_MINUTES = 5
@@ -186,31 +187,48 @@ function banner(cliState, status, pluginVersion) {
   return { tone: err.code === "rate_limited" ? "warn" : "error", text: err.message }
 }
 
+// Local date of a Unix time in seconds, as YYYY-MM-DD.
+function formatDate(seconds) {
+  if (typeof seconds !== "number" || !isFinite(seconds) || seconds <= 0) return ""
+  var d = new Date(seconds * 1000)
+  var pad = function(n) { return (n < 10 ? "0" : "") + n }
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+}
+
+// The sync record of a source for the current filters, or null.
+function sourceSync(status, key) {
+  var sources = status && status.sources ? status.sources : []
+  for (var i = 0; i < sources.length; i++) if (sources[i].key === key) return sources[i].sync || null
+  return null
+}
+
 // Sync control next to the page counter in the browse view, for a tag source.
-// Only one sync runs at a time, so a running sync of another source offers Cancel too.
-function syncView(sync, key, status) {
+// `running` is the sync in progress anywhere (only one runs at a time, so it offers Cancel on
+// every tab); `record` is this source's own result. A finished source has no action: its new
+// wallpapers get thumbnails when browsed.
+function syncView(running, record, key, status) {
   if (!key || key === FAVS) return null
   var label = function(k) { return sourceLabel(status, k) || k }
-  var progress = sync ? formatCount(sync.done) + " / " + (typeof sync.total === "number" ? formatCount(sync.total) : "…") : ""
+  var progress = function(r) { return formatCount(r.done) + " / " + (typeof r.total === "number" ? formatCount(r.total) : "…") }
   var view = { icon: Icons.sync, text: "", tooltip: "Sync all " + label(key) + " thumbnails", action: "start", tone: "normal", spinning: false }
-  if (sync && sync.state === "running") {
-    var here = sync.source === key
-    view.text = here ? progress : label(sync.source) + " " + progress
-    view.tooltip = here ? "Cancel sync" : "Cancel " + label(sync.source) + " sync"
+  if (running) {
+    var here = running.source === key
+    view.text = here ? progress(running) : label(running.source) + " " + progress(running)
+    view.tooltip = here ? "Cancel sync" : "Cancel " + label(running.source) + " sync"
     view.action = "cancel"
     view.spinning = true
-  } else if (sync && sync.source === key) {
-    if (sync.state === "done") {
-      view.icon = Icons.synced
-      view.tooltip = formatCount(sync.done) + " thumbnails synced · click to sync again"
-    } else if (sync.state === "failed") {
-      view.icon = Icons.syncAlert
-      view.tone = "error"
-      view.tooltip = "Sync failed: " + (sync.error && typeof sync.error.message === "string" ? sync.error.message : "unknown error") + " · click to retry"
-    } else if (sync.state === "canceled" || sync.state === "stopped") {
-      view.text = progress
-      view.tooltip = "Sync stopped · click to resume"
-    }
+  } else if (record && record.state === "done") {
+    view.icon = Icons.synced
+    view.tooltip = formatCount(record.done) + " thumbnails synced" + (formatDate(record.updatedAt) ? " on " + formatDate(record.updatedAt) : "")
+    view.action = ""
+  } else if (record && record.state === "failed") {
+    view.icon = Icons.syncAlert
+    view.tone = "error"
+    view.text = progress(record)
+    view.tooltip = "Sync failed: " + (record.error && typeof record.error.message === "string" ? record.error.message : "unknown error") + " · click to resume"
+  } else if (record && (record.state === "canceled" || record.state === "stopped")) {
+    view.text = progress(record)
+    view.tooltip = "Sync stopped · click to resume"
   }
   return view
 }
@@ -230,7 +248,36 @@ function browseRow(item) {
   }
 }
 
-// True when less than `screens` viewport heights of content remain below the view.
-function nearEnd(contentY, height, originY, contentHeight, screens) {
-  return originY + contentHeight - (contentY + height) < height * screens
+// Wheel acceleration: notches per second, averaged over recent events, sets a 1–4× step.
+// A pause of more than 300 ms starts slow again.
+function wheelSpeed(prevAvg, angle, dtMs) {
+  if (!(dtMs > 0) || dtMs > 300) return { avg: 0, boost: 1 }
+  var perSecond = Math.abs(angle) / 120 / (dtMs / 1000)
+  var avg = prevAvg > 0 ? (prevAvg + perSecond) / 2 : perSecond
+  return { avg: avg, boost: Math.max(1, Math.min(4, avg / 8)) }
+}
+
+// Wallhaven and the CLI both return 24 wallpapers per page.
+var PER_PAGE = 24
+
+function pageOf(index) { return Math.floor(index / PER_PAGE) + 1 }
+
+// The browse grid holds a card for every wallpaper of the source; pages fill in as needed.
+// Next page to fetch: the pages on screen, then 1.5 screens below, then one screen above.
+// 0 when they are all loaded. Before the first page arrives, `count` is 0 and page 1 is next.
+function nextPage(contentY, originY, height, cols, cellHeight, count, lastPage, loaded) {
+  if (count <= 0) return loaded[1] ? 0 : 1
+  cols = Math.max(1, cols)
+  var firstRow = Math.floor(Math.max(0, contentY - originY) / cellHeight)
+  var rows = Math.ceil(height / cellHeight) + 1
+  var first = Math.min(count - 1, firstRow * cols)
+  var last = Math.min(count - 1, (firstRow + rows) * cols - 1)
+  var below = Math.min(count - 1, last + Math.ceil(rows * 1.5) * cols)
+  var above = Math.max(0, first - rows * cols)
+  var order = []
+  for (var p = pageOf(first); p <= pageOf(below); p++) order.push(p)
+  for (p = pageOf(first) - 1; p >= pageOf(above); p--) order.push(p)
+  for (var i = 0; i < order.length; i++)
+    if (order[i] >= 1 && order[i] <= lastPage && !loaded[order[i]]) return order[i]
+  return 0
 }

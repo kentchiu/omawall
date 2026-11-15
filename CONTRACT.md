@@ -102,14 +102,14 @@ Error codes: `usage`, `config`, `network`, `timeout`, `rate_limited` (HTTP 429),
 | Command | Network | Result |
 |---|---|---|
 | `omawall --version` | no | prints `omawall <semver>` (same as `manifest.json` version) |
-| `omawall status` | no | `{ok, version, status, settings, sources: [{key, label, tag, selected, total}], favorites: {count, selected}, sync}` — `total` from `status.totals` for the current filters, else `null`; `sync` see below |
+| `omawall status` | no | `{ok, version, status, settings, sources: [{key, label, tag, selected, total, sync}], favorites: {count, selected}, sync}` — `total` from `status.totals` for the current filters, else `null`; `sync` fields see below |
 | `omawall next [--trigger manual\|timer]` | yes | applies the next wallpaper; `{ok, current}` |
 | `omawall apply <id> [--trigger manual]` | yes | downloads and applies that id; `{ok, current}` |
 | `omawall fav` | no* | toggles favorite for current; `{ok, favorite: bool, current}` |
 | `omawall browse <sourceKey\|favs> [--page N]` | yes | `{ok, source, page, lastPage, total, items: [{id, thumb, resolution, favorites, fileSize, seen, favorite, current}]}`, 24 per page, thumbnails downloaded first |
 | `omawall set <name> <value>` | no | `{ok, settings}`; names: `sources` (comma list, may be empty, may include `favs`), `style.general`, `style.anime` (`true`/`false`), `color` (`none`/`theme`), `timer.enabled` (`true`/`false`), `timer.minutes` (integer 5–1440) |
 
-| `omawall sync <sourceKey>` | yes | long-running: downloads every thumbnail of that tag source for the current filters; progress in `sync.json`; prints `{ok, sync}` when it ends as `done` or `canceled`, the failure envelope when `failed` |
+| `omawall sync <sourceKey>` | yes | long-running: downloads every thumbnail of that tag source for the current filters; progress in `syncs.json`; prints `{ok, sync}` when it ends as `done` or `canceled`, the failure envelope when `failed` |
 | `omawall sync --cancel` | no | asks a running sync to stop; `{ok, running: bool}` (whether a sync was running) |
 
 \* `fav` may download the current thumbnail if missing.
@@ -120,28 +120,38 @@ The plugin starts it detached (`Quickshell.execDetached`), so it outlives the pa
 
 1. `favs` or an unknown key → `usage` (checked first). Take `<state>/sync.lock` (wait up to 2 s; held → `busy`).
    Never hold `<state>/lock` while syncing, so `next`, `browse`, `fav` and `set` keep working. Delete a stale
-   `<state>/sync.cancel`. `usage`, `busy` and `config` errors write no `sync.json`.
-2. Build the query from the current settings (styles, color) like `next`. Walk pages 1..`last_page`.
+   `<state>/sync.cancel`. `usage`, `busy` and `config` errors write no `syncs.json`.
+2. Build the query from the current settings (styles, color) like `next`. Each query key has its own record:
+   - `done` → print it and stop, with no network: a finished query is never walked again. Wallpapers added
+     later get their thumbnails when browsed.
+   - `canceled`, `failed` or a dead `running` → resume at its `page` with `done = pageDone`,
+     `skipped = pageSkipped`, so that page is walked again and counted once.
+   - none → start at page 1.
+   Walk pages to `last_page`.
 3. Per item: thumbnail already in `thumbs/` (any extension) → count it; else download it with the same checks as
    `browse`. A failed thumbnail (`http`, `invalid_image`, `too_large`, `network`, `timeout`) counts as `skipped`
    and the sync goes on. Any other thumbnail error (`rate_limited`, `io`) ends it as `failed`.
 4. API page errors: `rate_limited` → wait 60 s and retry the same page, at most 3 times; `network`/`timeout` →
    retry once after 5 s; anything still failing → `state: "failed"` with `error`.
 5. Before each thumbnail, if `<state>/sync.cancel` exists → delete it, `state: "canceled"`, stop.
-6. `sync.json` (atomic) is written when the sync starts, after every page, at most once per second while
-   downloading, and when it ends:
+6. `syncs.json` (atomic, written only by the sync holding the lock; other queries' records are kept) is
+   written when the sync starts, at every page boundary, at most once per second while downloading, and when
+   it ends:
    ```json
-   { "version": 1, "source": "landscape", "queryKey": "tag:711|cat:100|color:none",
-     "state": "running", "done": 120, "skipped": 0, "total": 4071, "page": 6, "lastPage": 170,
-     "error": null, "startedAt": 1794700000, "updatedAt": 1794700000 }
+   { "version": 1, "queries": { "tag:711|cat:100|color:none": {
+       "source": "landscape", "queryKey": "tag:711|cat:100|color:none", "state": "running",
+       "done": 120, "skipped": 0, "total": 4071, "page": 6, "lastPage": 170, "pageDone": 120, "pageSkipped": 0,
+       "error": null, "startedAt": 1794700000, "updatedAt": 1794700000 } } }
    ```
    `state`: `running`, `done`, `canceled`, `failed`. `done` counts thumbnails now on disk (downloaded or already there).
-   `page` is the page being walked (1 before the first page arrives). `total` and `lastPage` are `null` until the
-   first page arrives. `error` is `{code, message}` or `null`. At the end the thumbnail cache is trimmed like `browse`.
+   `page` is the page being walked (1 before the first page arrives); `pageDone`/`pageSkipped` are the counts
+   before it. `total` and `lastPage` are `null` until the first page arrives. `error` is `{code, message}` or
+   `null`. At the end the thumbnail cache is trimmed like `browse`. `sync.json` from 0.2.0 is not read.
 7. `sync` never notifies and never touches `status.json`, `seen.json` or `favorites.json`.
 
-`status.sync` is `sync.json` without `version`, or `null` when there is none. When its `state` is `running` but
-`<state>/sync.lock` is free (the process died), `status` reports `state: "stopped"`.
+`status.sources[].sync` is that source's record for the current filters, or `null`. `status.sync` is the record
+being synced right now, or `null`. A `running` record while `<state>/sync.lock` is free (the process died) is
+reported as `state: "stopped"`.
 `sync --cancel` creates `<state>/sync.cancel` only when `sync.lock` is held.
 
 ### `next` selection

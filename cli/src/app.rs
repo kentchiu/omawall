@@ -232,6 +232,7 @@ impl App {
     fn status(&self) -> Result<Output> {
         let s = self.load()?;
         let color = self.color(&s.settings);
+        let syncs = sync::records(&self.paths)?;
         let sources: Vec<Value> = s
             .sources
             .iter()
@@ -241,6 +242,7 @@ impl App {
                     "key": src.key, "label": src.label, "tag": src.tag,
                     "selected": s.settings.is_selected(&src.key),
                     "total": s.status.totals.get(&key),
+                    "sync": sync::source_view(&syncs, &key),
                 })
             })
             .collect();
@@ -250,7 +252,7 @@ impl App {
             "settings": s.settings,
             "sources": sources,
             "favorites": {"count": s.favorites.items.len(), "selected": s.settings.is_selected(FAVS)},
-            "sync": sync::status_view(&self.paths)?,
+            "sync": sync::running_view(&syncs),
         })))
     }
 
@@ -448,8 +450,10 @@ impl App {
             ));
         }
         cache::evict_thumbs(&self.paths.thumbs_dir(), cache::THUMBS_MAX_BYTES);
-        s.status.totals.insert(query.key(), result.total);
-        self.write_status(&mut s.status)?;
+        // Every rewrite makes the widget reload, so skip it when nothing changed.
+        if s.status.totals.insert(query.key(), result.total) != Some(result.total) {
+            self.write_status(&mut s.status)?;
+        }
         Ok(output(json!({
             "source": key, "page": page, "lastPage": result.last_page,
             "total": result.total, "items": items,
@@ -781,7 +785,7 @@ pub mod tests {
         assert_eq!(out["sources"].as_array().unwrap().len(), 10);
         assert_eq!(
             out["sources"][0],
-            json!({"key":"landscape","label":"Landscape","tag":711,"selected":true,"total":null})
+            json!({"key":"landscape","label":"Landscape","tag":711,"selected":true,"total":null,"sync":null})
         );
         assert_eq!(out["favorites"], json!({"count": 0, "selected": false}));
         assert_eq!(out["sync"], Value::Null);
@@ -927,6 +931,21 @@ pub mod tests {
         assert_eq!(out["favorite"], false);
         let path = out["current"]["path"].as_str().unwrap().to_string();
         assert!(path.ends_with("/full/wallhaven-aa1.jpg") && Path::new(&path).is_file());
+    }
+
+    #[test]
+    fn browse_rewrites_status_only_when_the_total_changes() {
+        let app = test_app("app-browse-status", landscape(&["aa1", "aa2"]));
+        run(&app, &["browse", "landscape"]).unwrap();
+        // Mark the file; an unchanged total must leave it alone, since every rewrite
+        // makes the widget reload its status while the user scrolls.
+        let path = app.paths.state("status.json");
+        let mut status: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        status["updatedAt"] = json!(1);
+        fs::write(&path, serde_json::to_vec(&status).unwrap()).unwrap();
+        run(&app, &["browse", "landscape"]).unwrap();
+        let after: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["updatedAt"], 1);
     }
 
     #[test]

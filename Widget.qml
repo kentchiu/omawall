@@ -15,6 +15,7 @@ Panel {
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || (home + "/.local/state")
+  readonly property string thumbsDir: (Quickshell.env("XDG_CACHE_HOME") || (home + "/.cache")) + "/omawall/thumbs"
   readonly property string commandPath: home + "/.local/bin/omawall"
   readonly property color fg: Color.popups.text
   readonly property color dim: Qt.darker(fg, 1.45)
@@ -28,16 +29,17 @@ Panel {
 
   property bool browseOpen: false
   property string browseSource: ""
-  property int browsePage: 0
   property int browseLastPage: 0
   property int browseTotal: 0
+  property int browseLoaded: 0
   property string browseError: ""
-  property bool browseBusy: false
-  // The next page, fetched in the background so scrolling rarely waits.
-  property var prefetched: null
-  property bool prefetchWanted: false
+  // Pages of the current source already in the grid, by page number.
+  property var loadedPages: ({})
+  readonly property bool browseBusy: browseProc.running
+  // Repeaters rebuild every delegate when handed a new array; these change only when their content does.
+  property var sources: []
+  property var tabList: []
 
-  readonly property var sources: status && status.sources ? status.sources : []
   readonly property var favInfo: status && status.favorites ? status.favorites : ({ count: 0, selected: false })
   readonly property var userSettings: status && status.settings ? status.settings : ({})
   readonly property var current: status && status.status ? status.status.current : null
@@ -47,7 +49,8 @@ Panel {
   readonly property bool timerEnabled: !!(userSettings.timer && userSettings.timer.enabled)
   readonly property int timerMinutes: Model.clampMinutes(userSettings.timer ? userSettings.timer.minutes : 60)
   readonly property bool busy: actionProc.running
-  readonly property var syncInfo: Model.syncView(status && status.sync ? status.sync : null, browseSource, status)
+  readonly property var syncInfo: Model.syncView(status && status.sync ? status.sync : null,
+                                                 Model.sourceSync(status, browseSource), browseSource, status)
 
   implicitWidth: barButton.implicitWidth
   implicitHeight: barButton.implicitHeight
@@ -64,56 +67,53 @@ Panel {
   function setSetting(name, value) { runAction(["set", name, String(value)]) }
   function openUrl(url) { if (url) Qt.openUrlExternally(url) }
 
-  function loadBrowse(key, page) {
-    if (browseBusy) return
-    browseBusy = true
-    if (page === 1) { browseModel.clear(); browsePage = 0; browseLastPage = 0; browseTotal = 0; prefetched = null }
+  // The grid holds a card for every wallpaper of the source, so the scrollbar spans all of it;
+  // pages fill in around wherever the view is, one CLI call at a time.
+  function loadBrowse(key) {
+    wheelGlide.stop()
+    browseModel.clear()
     browseSource = key
+    browseLastPage = 0
+    browseTotal = 0
+    browseLoaded = 0
     browseError = ""
-    browseProc.start([root.commandPath, "browse", key, "--page", String(page)])
+    loadedPages = ({})
+    pumpBrowse()
+  }
+  function pumpBrowse() {
+    if (!browseOpen || browseSource === "" || browseProc.running || browseError !== "") return
+    var cols = Math.max(1, Math.floor(grid.width / grid.cellWidth))
+    var page = Model.nextPage(grid.contentY, grid.originY, grid.height, cols, grid.cellHeight,
+                              browseModel.count, browseLastPage, loadedPages)
+    if (page > 0) browseProc.start(browseSource, page)
   }
   function acceptPage(result) {
-    if (result.source !== browseSource) return
-    // Append only the new cards; replacing the whole model would rebuild every card.
-    if (result.page === 1) browseModel.clear()
     var items = Array.isArray(result.items) ? result.items : []
-    for (var i = 0; i < items.length; i++) browseModel.append(Model.browseRow(items[i]))
-    browsePage = result.page
-    browseLastPage = result.lastPage
-    browseTotal = result.total
-    Qt.callLater(function() { if (root.wantsMore()) root.loadMore(); else root.startPrefetch() })
-  }
-  // Load ahead while 1.5 screens of cards remain, so scrolling never reaches the end and stops.
-  function wantsMore() {
-    return Model.nearEnd(grid.contentY, grid.height, grid.originY, grid.contentHeight, 1.5)
-  }
-  function loadMore() {
-    if (browseBusy || browsePage <= 0 || browsePage >= browseLastPage) return
-    var next = browsePage + 1
-    if (prefetched && prefetched.source === browseSource && prefetched.page === next) {
-      var ready = prefetched
-      prefetched = null
-      acceptPage(ready)
-      return
+    var start = (result.page - 1) * Model.PER_PAGE
+    if (browseLastPage === 0) {
+      browseTotal = result.total
+      browseLastPage = result.lastPage
+      var blanks = []
+      for (var i = 0; i < result.total; i++) blanks.push(Model.browseRow(null))
+      browseModel.append(blanks)
     }
-    if (prefetchProc.running && prefetchProc.source === browseSource && prefetchProc.page === next) {
-      browseBusy = true
-      prefetchWanted = true
-      return
+    for (var k = 0; k < items.length; k++) {
+      var row = Model.browseRow(items[k])
+      if (start + k < browseModel.count) browseModel.set(start + k, row)
+      else browseModel.append(row)
     }
-    loadBrowse(browseSource, next)
-  }
-  function startPrefetch() {
-    var next = browsePage + 1
-    if (!browseOpen || browsePage <= 0 || next > browseLastPage || prefetchProc.running) return
-    if (prefetched && prefetched.source === browseSource && prefetched.page === next) return
-    prefetched = null
-    prefetchProc.start(browseSource, next)
+    // Wallhaven's total drifts a little; the last page settles the real length.
+    var end = start + items.length
+    if (result.page >= browseLastPage && browseModel.count > end) browseModel.remove(end, browseModel.count - end)
+    var pages = loadedPages
+    pages[result.page] = true
+    loadedPages = pages
+    browseLoaded += items.length
   }
   function openBrowse() {
     root.close()
     browseOpen = true
-    loadBrowse(Model.firstBrowseKey(status), 1)
+    loadBrowse(Model.firstBrowseKey(status))
     Qt.callLater(function() { browseScope.forceActiveFocus() })
   }
   function closeBrowse() { browseOpen = false }
@@ -121,7 +121,7 @@ Panel {
     closeBrowse()
     runAction(["apply", id])
   }
-  // Sync outlives the panel and the browse view; progress comes back through sync.json.
+  // Sync outlives the panel and the browse view; progress comes back through syncs.json.
   function syncAction() {
     if (!syncInfo) return
     if (syncInfo.action === "cancel") runAction(["sync", "--cancel"])
@@ -129,6 +129,12 @@ Panel {
   }
 
   onOpenedChanged: if (opened) refreshStatus()
+  onStatusChanged: {
+    var list = status && status.sources ? status.sources : []
+    if (JSON.stringify(list) !== JSON.stringify(sources)) sources = list
+    var tabs = Model.browseTabs(status)
+    if (JSON.stringify(tabs) !== JSON.stringify(tabList)) tabList = tabs
+  }
   Component.onCompleted: refreshStatus()
 
   // The plugin version comes from its own manifest so a stale CLI is reported.
@@ -153,7 +159,7 @@ Panel {
     onFileChanged: statusDebounce.restart()
   }
   FileView {
-    path: root.stateHome + "/omawall/sync.json"
+    path: root.stateHome + "/omawall/syncs.json"
     watchChanges: true
     printErrors: false
     onFileChanged: statusDebounce.restart()
@@ -211,56 +217,28 @@ Panel {
 
   Process {
     id: browseProc
+    property string source: ""
     property bool exitSeen: true
-    function start(argv) { exitSeen = false; command = argv; running = true }
+    function start(key, page) {
+      exitSeen = false
+      source = key
+      command = [root.commandPath, "browse", key, "--page", String(page)]
+      running = true
+    }
     stdout: StdioCollector { id: browseOut; waitForEnd: true }
     onExited: function(code) {
       exitSeen = true
-      root.browseBusy = false
-      var result = Model.parseResult(browseOut.text)
-      if (!result.ok) { root.browseError = result.error.message; return }
-      root.acceptPage(result)
-    }
-    onRunningChanged: {
-      if (!running) Qt.callLater(function() {
-        if (!browseProc.exitSeen && !browseProc.running) { browseProc.exitSeen = true; root.browseBusy = false; root.browseError = "Could not run the omawall CLI." }
-      })
-    }
-  }
-
-  Process {
-    id: prefetchProc
-    property string source: ""
-    property int page: 0
-    property bool exitSeen: true
-    function start(key, n) {
-      exitSeen = false
-      source = key
-      page = n
-      command = [root.commandPath, "browse", key, "--page", String(n)]
-      running = true
-    }
-    stdout: StdioCollector { id: prefetchOut; waitForEnd: true }
-    onExited: function(code) {
-      exitSeen = true
-      var result = Model.parseResult(prefetchOut.text)
-      var wanted = root.prefetchWanted
-      root.prefetchWanted = false
-      if (wanted) {
-        // The user scrolled here while it loaded: show it now.
-        root.browseBusy = false
-        if (result.ok) root.acceptPage(result)
-        else root.browseError = result.error.message
-        return
+      // A reply for a source the user has left is dropped.
+      if (source === root.browseSource) {
+        var result = Model.parseResult(browseOut.text)
+        if (!result.ok) root.browseError = result.error.message
+        else if (result.source === root.browseSource) root.acceptPage(result)
       }
-      if (result.ok && result.source === root.browseSource && result.page === root.browsePage + 1) root.prefetched = result
+      Qt.callLater(root.pumpBrowse)
     }
     onRunningChanged: {
       if (!running) Qt.callLater(function() {
-        if (!prefetchProc.exitSeen && !prefetchProc.running) {
-          prefetchProc.exitSeen = true
-          if (root.prefetchWanted) { root.prefetchWanted = false; root.browseBusy = false; root.browseError = "Could not run the omawall CLI." }
-        }
+        if (!browseProc.exitSeen && !browseProc.running) { browseProc.exitSeen = true; root.browseError = "Could not run the omawall CLI." }
       })
     }
   }
@@ -544,12 +522,12 @@ Panel {
             Layout.fillWidth: true
             spacing: Style.spacing.md
             Repeater {
-              model: Model.browseTabs(root.status)
+              model: root.tabList
               delegate: ActionButton {
                 required property var modelData
                 text: (modelData.selected ? "• " : "") + modelData.label + "  " + Model.formatCount(modelData.count)
                 selected: root.browseSource === modelData.key
-                onClicked: root.loadBrowse(modelData.key, 1)
+                onClicked: root.loadBrowse(modelData.key)
               }
             }
           }
@@ -561,7 +539,7 @@ Panel {
           }
           Label {
             visible: root.browseError === "" && browseModel.count === 0
-            text: root.browseBusy ? "Loading…"
+            text: root.browseLastPage === 0 ? "Loading…"
               : (root.browseSource === "favs" ? "No favorites yet. Press Favorite in the panel to add the current wallpaper." : "No wallpapers match these filters.")
             color: Qt.darker(Color.foreground, 1.45)
           }
@@ -578,8 +556,52 @@ Panel {
             cellHeight: 243 + Style.space(40)
             model: ListModel { id: browseModel }
             boundsBehavior: Flickable.StopAtBounds
-            QQC.ScrollBar.vertical: QQC.ScrollBar {}
-            onContentYChanged: if (root.wantsMore()) root.loadMore()
+            // Build cards and decode thumbnails a screen ahead, so they are ready before they scroll in.
+            cacheBuffer: Math.max(0, Math.round(height))
+            // Thousands of cards would shrink the handle to a sliver; keep it grabbable.
+            QQC.ScrollBar.vertical: QQC.ScrollBar { minimumSize: 0.05; onPressedChanged: if (pressed) wheelGlide.stop() }
+            // Fetch the pages under the view at most every 150 ms while it moves.
+            onContentYChanged: if (!pumpTimer.running) pumpTimer.start()
+            onHeightChanged: if (!pumpTimer.running) pumpTimer.start()
+            Timer { id: pumpTimer; interval: 150; onTriggered: root.pumpBrowse() }
+
+            // A mouse wheel moves one row per notch, up to four when spun fast. Each frame closes
+            // part of the gap to the target, so continued spinning keeps a steady speed instead of
+            // restarting an ease per notch. Touchpads keep Flickable's own scrolling.
+            property real wheelAvg: 0
+            property double wheelAt: 0
+            property real glideTarget: 0
+            FrameAnimation {
+              id: wheelGlide
+              onTriggered: {
+                var k = 1 - Math.exp(-Math.min(frameTime, 0.05) / 0.07)
+                var y = grid.contentY + (grid.glideTarget - grid.contentY) * k
+                if (Math.abs(grid.glideTarget - y) < 0.5) {
+                  y = grid.glideTarget
+                  stop()
+                }
+                grid.contentY = y
+              }
+            }
+            WheelHandler {
+              target: null
+              // Wayland hands wheel events to Qt as a touchpad device, so a mouse-only handler sees nothing.
+              acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+              onWheel: function(event) {
+                // Touchpads scroll in phases; a wheel has none. Wayland gives wheels pixel deltas too,
+                // so those cannot tell them apart.
+                if (event.phase !== Qt.NoScrollPhase || event.angleDelta.y === 0) { event.accepted = false; return }
+                var now = Date.now()
+                var speed = Model.wheelSpeed(grid.wheelAvg, event.angleDelta.y, now - grid.wheelAt)
+                grid.wheelAvg = speed.avg
+                grid.wheelAt = now
+                var bottom = grid.originY + Math.max(0, grid.contentHeight - grid.height)
+                var from = wheelGlide.running ? grid.glideTarget : grid.contentY
+                grid.glideTarget = Math.max(grid.originY, Math.min(bottom, from - event.angleDelta.y / 120 * grid.cellHeight * speed.boost))
+                if (!wheelGlide.running) wheelGlide.start()
+                event.accepted = true
+              }
+            }
 
             delegate: Item {
               id: card
@@ -614,6 +636,7 @@ Panel {
                   anchors.left: parent.left
                   anchors.bottom: parent.bottom
                   anchors.margins: Style.space(6)
+                  visible: card.wid !== ""
                   text: Model.formatResolution(card.resolution) + " · " + Model.formatSize(card.size)
                   color: Qt.darker(Color.foreground, 1.3)
                   font.pixelSize: Style.font.bodySmall
@@ -623,6 +646,7 @@ Panel {
                   anchors.right: parent.right
                   anchors.bottom: parent.bottom
                   anchors.margins: Style.space(6)
+                  visible: card.wid !== ""
                   text: Model.formatCount(card.favs) + " favorites"
                   color: Qt.darker(Color.foreground, 1.3)
                   font.pixelSize: Style.font.bodySmall
@@ -639,6 +663,7 @@ Panel {
                 MouseArea {
                   id: mouse
                   anchors.fill: parent
+                  enabled: card.wid !== ""
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
                   onClicked: root.applyFromBrowse(card.wid)
@@ -653,14 +678,16 @@ Panel {
             Layout.fillWidth: true
             spacing: Style.spacing.md
             Label {
-              visible: root.browsePage > 0
-              text: "Page " + root.browsePage + " of " + root.browseLastPage + " · " + Model.formatCount(browseModel.count)
-                + " of " + Model.formatCount(root.browseTotal) + " loaded" + (root.browseBusy ? " · loading…" : "")
+              visible: root.browseLastPage > 0
+              text: "Page " + Math.min(root.browseLastPage, Model.pageOf(Math.floor(Math.max(0, grid.contentY - grid.originY) / grid.cellHeight)
+                                                                         * Math.max(1, Math.floor(grid.width / grid.cellWidth))))
+                + " of " + root.browseLastPage + " · " + Model.formatCount(root.browseLoaded) + " of "
+                + Model.formatCount(root.browseTotal) + " loaded" + (root.browseBusy ? " · loading…" : "")
               color: Qt.darker(Color.foreground, 1.45)
               wrapMode: Text.NoWrap
             }
             Button {
-              visible: root.syncInfo !== null && root.browsePage > 0
+              visible: root.syncInfo !== null && root.browseLastPage > 0
               iconText: root.syncInfo ? root.syncInfo.icon : ""
               iconSpinning: root.syncInfo !== null && root.syncInfo.spinning
               text: root.syncInfo ? root.syncInfo.text : ""
@@ -671,6 +698,15 @@ Panel {
               Accessible.role: Accessible.Button
               Accessible.name: tooltipText
               onClicked: root.syncAction()
+            }
+            Button {
+              visible: root.browseLastPage > 0
+              iconText: Model.Icons.folder
+              tooltipText: "Open thumbnails folder"
+              foreground: Qt.darker(Color.foreground, 1.45)
+              Accessible.role: Accessible.Button
+              Accessible.name: tooltipText
+              onClicked: Util.execArgv(["xdg-open", root.thumbsDir])
             }
             Item { Layout.fillWidth: true }
           }

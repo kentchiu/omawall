@@ -1,9 +1,13 @@
 //! `omawall sync`: downloads every thumbnail of one tag source, outside the main lock.
+//! Each query (source + filters) keeps its own record in `syncs.json`: a finished one is not
+//! walked again, and an interrupted one resumes at the page it stopped on.
 
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,14 +23,14 @@ use crate::wallhaven::{self, Query, SearchPage};
 
 pub const SYNC_LOCK: &str = "sync.lock";
 const CANCEL_FILE: &str = "sync.cancel";
-const SYNC_FILE: &str = "sync.json";
+const SYNC_FILE: &str = "syncs.json";
 
 /// Minimum gap between two API requests, so `next` and `browse` keep rate-limit headroom.
 pub const API_SPACING: Duration = Duration::from_secs(2);
 pub const RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 pub const RATE_LIMIT_RETRIES: u32 = 3;
 pub const NETWORK_WAIT: Duration = Duration::from_secs(5);
-/// `sync.json` is rewritten at most this often while downloading thumbnails.
+/// `syncs.json` is rewritten at most this often while downloading thumbnails.
 pub const WRITE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Thumbnail failures that only skip that thumbnail.
@@ -62,11 +66,10 @@ pub struct SyncError {
     pub message: String,
 }
 
-/// `sync.json`.
+/// One query's record in `syncs.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncState {
-    pub version: u32,
     pub source: String,
     pub query_key: String,
     pub state: String,
@@ -76,29 +79,50 @@ pub struct SyncState {
     /// The page being walked (1 before the first page arrives).
     pub page: u64,
     pub last_page: Option<u64>,
+    /// `done` and `skipped` before `page`, so a resumed sync can walk `page` again and count right.
+    pub page_done: u64,
+    pub page_skipped: u64,
     pub error: Option<SyncError>,
     pub started_at: u64,
     pub updated_at: u64,
 }
 
-/// `sync.json` as shown to callers: without `version`.
-fn view(sync: &SyncState) -> Value {
-    let mut value = serde_json::to_value(sync).expect("sync state serializes");
-    if let Value::Object(map) = &mut value {
-        map.remove("version");
-    }
-    value
+/// `syncs.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Syncs {
+    pub version: u32,
+    pub queries: BTreeMap<String, SyncState>,
 }
 
-/// `status.sync`: `null` without `sync.json`; `running` with a free lock is reported as `stopped`.
-pub fn status_view(paths: &Paths) -> Result<Value> {
-    let Some(mut sync) = state::read_json::<Option<SyncState>>(&paths.state(SYNC_FILE))? else {
-        return Ok(Value::Null);
-    };
-    if sync.state == "running" && !state::is_locked(&paths.state(SYNC_LOCK)) {
-        sync.state = "stopped".into();
+/// Every record, with `running` turned into `stopped` when no sync process holds the lock.
+pub fn records(paths: &Paths) -> Result<Syncs> {
+    let mut syncs = state::read_json::<Syncs>(&paths.state(SYNC_FILE))?;
+    if !state::is_locked(&paths.state(SYNC_LOCK)) {
+        for record in syncs.queries.values_mut() {
+            if record.state == "running" {
+                record.state = "stopped".into();
+            }
+        }
     }
-    Ok(view(&sync))
+    Ok(syncs)
+}
+
+/// `status.sync`: the running record, or `null`.
+pub fn running_view(syncs: &Syncs) -> Value {
+    syncs
+        .queries
+        .values()
+        .filter(|record| record.state == "running")
+        .max_by_key(|record| record.updated_at)
+        .map_or(Value::Null, |record| json!(record))
+}
+
+/// `status.sources[].sync`: the record for that query key, or `null`.
+pub fn source_view(syncs: &Syncs, query_key: &str) -> Value {
+    syncs
+        .queries
+        .get(query_key)
+        .map_or(Value::Null, |record| json!(record))
 }
 
 /// `sync --cancel`: asks a running sync to stop.
@@ -123,20 +147,29 @@ pub fn sync(app: &App, key: &str) -> Result<Output> {
 
     let _lock = state::acquire_named_lock(&app.paths.state_dir, SYNC_LOCK, app.sync_lock_wait)?;
     let _ = fs::remove_file(app.paths.state(CANCEL_FILE));
+    // The lock is ours, so any `running` record left behind belongs to a dead process.
+    let earlier = records(&app.paths)?.queries.remove(&query.key());
+    if let Some(done) = earlier.as_ref().filter(|record| record.state == "done") {
+        return Ok(output(json!({"sync": done})));
+    }
     let started = now();
+    let (page, done, skipped) = earlier.as_ref().map_or((1, 0, 0), |record| {
+        (record.page, record.page_done, record.page_skipped)
+    });
     let mut run = Run {
         app,
         path: app.paths.state(SYNC_FILE),
         state: SyncState {
-            version: 1,
             source: key.into(),
             query_key: query.key(),
             state: "running".into(),
-            done: 0,
-            skipped: 0,
-            total: None,
-            page: 1,
-            last_page: None,
+            done,
+            skipped,
+            total: earlier.as_ref().and_then(|record| record.total),
+            page,
+            last_page: earlier.as_ref().and_then(|record| record.last_page),
+            page_done: done,
+            page_skipped: skipped,
             error: None,
             started_at: started,
             updated_at: started,
@@ -150,7 +183,7 @@ pub fn sync(app: &App, key: &str) -> Result<Output> {
         Ok(end) => {
             run.state.state = end.into();
             run.write()?;
-            Ok(output(json!({"sync": view(&run.state)})))
+            Ok(output(json!({"sync": run.state})))
         }
         Err(e) => {
             run.state.state = "failed".into();
@@ -173,12 +206,14 @@ struct Run<'a> {
 }
 
 impl Run<'_> {
-    /// Walks pages 1..=last_page; returns the end state (`done` or `canceled`).
+    /// Walks pages from `state.page` to the last; returns the end state (`done` or `canceled`).
     fn walk(&mut self, query: &Query) -> Result<&'static str> {
         let thumbs = self.app.paths.thumbs_dir();
-        let mut page = 1;
+        let mut page = self.state.page.max(1);
         loop {
             self.state.page = page;
+            self.state.page_done = self.state.done;
+            self.state.page_skipped = self.state.skipped;
             let result = self.search(query, page)?;
             self.state.total = Some(result.total);
             self.state.last_page = Some(result.last_page);
@@ -196,11 +231,15 @@ impl Run<'_> {
                     self.write()?;
                 }
             }
-            self.write()?;
             if page >= result.last_page {
                 return Ok("done");
             }
             page += 1;
+            // Record the page boundary, so a resume starts at the next page.
+            self.state.page = page;
+            self.state.page_done = self.state.done;
+            self.state.page_skipped = self.state.skipped;
+            self.write()?;
         }
     }
 
@@ -241,10 +280,16 @@ impl Run<'_> {
         fs::remove_file(self.app.paths.state(CANCEL_FILE)).is_ok()
     }
 
+    /// Rewrites this query's record; only a sync holding the lock writes `syncs.json`.
     fn write(&mut self) -> Result<()> {
         self.state.updated_at = now();
         self.last_write = self.app.clock.elapsed();
-        state::write_json(&self.path, &self.state)
+        let mut syncs = state::read_json::<Syncs>(&self.path)?;
+        syncs.version = 1;
+        syncs
+            .queries
+            .insert(self.state.query_key.clone(), self.state.clone());
+        state::write_json(&self.path, &syncs)
     }
 }
 
@@ -296,9 +341,36 @@ mod tests {
     }
 
     fn sync_file(app: &App) -> SyncState {
-        state::read_json::<Option<SyncState>>(&app.paths.state(SYNC_FILE))
-            .unwrap()
-            .unwrap()
+        let syncs = state::read_json::<Syncs>(&app.paths.state(SYNC_FILE)).unwrap();
+        assert_eq!(syncs.version, 1);
+        syncs.queries[KEY].clone()
+    }
+
+    fn record(state: &str, page: u64, done: u64) -> SyncState {
+        SyncState {
+            source: "landscape".into(),
+            query_key: KEY.into(),
+            state: state.into(),
+            done,
+            skipped: 0,
+            total: Some(4),
+            page,
+            last_page: Some(2),
+            page_done: done,
+            page_skipped: 0,
+            error: None,
+            started_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    fn save_record(app: &App, record: SyncState) {
+        let mut syncs = Syncs {
+            version: 1,
+            ..Syncs::default()
+        };
+        syncs.queries.insert(KEY.into(), record);
+        state::write_json(&app.paths.state(SYNC_FILE), &syncs).unwrap();
     }
 
     #[test]
@@ -336,8 +408,7 @@ mod tests {
         assert_eq!(clock.sleeps(), [API_SPACING]);
         assert!(!app.paths.state(CANCEL_FILE).exists());
 
-        let file = sync_file(&app);
-        assert_eq!((file.version, file.state.as_str()), (1, "done"));
+        assert_eq!(sync_file(&app).state, "done");
         // sync never touches the selection state files.
         for name in ["status.json", "seen.json", "favorites.json"] {
             assert!(!app.paths.state(name).exists(), "{name}");
@@ -417,33 +488,74 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_stopped_when_lock_is_free() {
+    fn status_reports_records_per_source_and_stopped_when_lock_is_free() {
         let (app, _) = sync_app("sync-status", FakeTransport::default());
-        assert_eq!(run(&app, &["status"]).unwrap()["sync"], Value::Null);
-
-        let sync = SyncState {
-            version: 1,
-            source: "landscape".into(),
-            query_key: KEY.into(),
-            state: "running".into(),
-            done: 5,
-            skipped: 0,
-            total: Some(10),
-            page: 1,
-            last_page: Some(1),
-            error: None,
-            started_at: 1,
-            updated_at: 2,
-        };
-        state::write_json(&app.paths.state(SYNC_FILE), &sync).unwrap();
         let out = run(&app, &["status"]).unwrap();
-        assert_eq!(out["sync"]["state"], "stopped");
-        assert_eq!(out["sync"]["done"], 5);
-        assert!(out["sync"].get("version").is_none());
+        assert_eq!(
+            (&out["sync"], &out["sources"][0]["sync"]),
+            (&Value::Null, &Value::Null)
+        );
+
+        save_record(&app, record("running", 1, 5));
+        let out = run(&app, &["status"]).unwrap();
+        // The process died: nothing runs, and the source shows where it stopped.
+        assert_eq!(out["sync"], Value::Null);
+        assert_eq!(out["sources"][0]["sync"]["state"], "stopped");
+        assert_eq!(out["sources"][0]["sync"]["done"], 5);
+        assert_eq!(out["sources"][1]["sync"], Value::Null);
 
         let _held =
             state::acquire_named_lock(&app.paths.state_dir, SYNC_LOCK, Duration::ZERO).unwrap();
-        assert_eq!(run(&app, &["status"]).unwrap()["sync"]["state"], "running");
+        let out = run(&app, &["status"]).unwrap();
+        assert_eq!(out["sync"]["source"], "landscape");
+        assert_eq!(out["sources"][0]["sync"]["state"], "running");
+    }
+
+    #[test]
+    fn resume_continues_at_the_page_it_stopped_on() {
+        let t = Arc::new(two_pages());
+        let (app, _) = sync_app("sync-resume", t.clone());
+        // Page 1 finished (2 done) before the sync was canceled on page 2.
+        save_record(&app, record("canceled", 2, 2));
+        let out = run(&app, &["sync", "landscape"]).unwrap();
+        assert_eq!(out["sync"]["state"], "done");
+        assert_eq!(out["sync"]["done"], 4);
+        assert!(
+            !t.calls().contains(&page_url(1)),
+            "page 1 is not walked again"
+        );
+        assert!(t.calls().contains(&page_url(2)));
+    }
+
+    #[test]
+    fn a_finished_sync_is_not_walked_again() {
+        let t = Arc::new(two_pages());
+        let (app, _) = sync_app("sync-finished", t.clone());
+        save_record(&app, record("done", 2, 4));
+        let out = run(&app, &["sync", "landscape"]).unwrap();
+        assert_eq!(
+            (&out["sync"]["state"], &out["sync"]["done"]),
+            (&json!("done"), &json!(4))
+        );
+        assert!(t.calls().is_empty());
+    }
+
+    #[test]
+    fn records_of_other_queries_are_kept() {
+        let (app, _) = sync_app("sync-keep", two_pages());
+        let mut other = record("done", 2, 9);
+        other.query_key = "tag:37|cat:100|color:none".into();
+        other.source = "nature".into();
+        let mut syncs = Syncs {
+            version: 1,
+            ..Syncs::default()
+        };
+        syncs.queries.insert(other.query_key.clone(), other);
+        state::write_json(&app.paths.state(SYNC_FILE), &syncs).unwrap();
+        run(&app, &["sync", "landscape"]).unwrap();
+        let syncs = state::read_json::<Syncs>(&app.paths.state(SYNC_FILE)).unwrap();
+        assert_eq!(syncs.queries.len(), 2);
+        assert_eq!(syncs.queries["tag:37|cat:100|color:none"].done, 9);
     }
 
     #[test]

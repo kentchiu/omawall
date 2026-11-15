@@ -107,22 +107,31 @@ test('markup-shaped CLI text passes through as plain data', () => {
   assert.equal(M.sourceLabel({ sources: [{ key: 'x', label: '<b>x</b>' }] }, 'x'), '<b>x</b>');
 });
 
-test('sync control is an icon with progress only while it matters', () => {
-  assert.equal(M.syncView(null, 'favs', status), null);
-  const idle = M.syncView(null, 'landscape', status);
+test('sync control: progress while running, a check when done, resume otherwise', () => {
+  assert.equal(M.syncView(null, null, 'favs', status), null);
+  const idle = M.syncView(null, null, 'landscape', status);
   assert.deepEqual([idle.icon, idle.text, idle.tooltip, idle.action], [M.Icons.sync, '', 'Sync all Landscape thumbnails', 'start']);
-  const running = { source: 'landscape', state: 'running', done: 1234, total: 4071, skipped: 0 };
-  const here = M.syncView(running, 'landscape', status);
+  const running = { source: 'landscape', state: 'running', done: 1234, total: 4071, skipped: 0, updatedAt: 1794700000 };
+  const here = M.syncView(running, running, 'landscape', status);
   assert.deepEqual([here.text, here.action, here.spinning, here.tooltip], ['1,234 / 4,071', 'cancel', true, 'Cancel sync']);
-  assert.equal(M.syncView(running, 'city', status).text, 'Landscape 1,234 / 4,071');
-  assert.equal(M.syncView({ ...running, total: null, done: 0 }, 'landscape', status).text, '0 / …');
-  const done = M.syncView({ ...running, state: 'done' }, 'landscape', status);
-  assert.deepEqual([done.icon, done.text, done.action], [M.Icons.synced, '', 'start']);
-  assert.equal(M.syncView({ ...running, state: 'stopped' }, 'landscape', status).text, '1,234 / 4,071');
-  const failed = M.syncView({ ...running, state: 'failed', error: { code: 'network', message: 'No connection' } }, 'landscape', status);
-  assert.deepEqual([failed.icon, failed.tone, failed.tooltip], [M.Icons.syncAlert, 'error', 'Sync failed: No connection · click to retry']);
-  // A finished sync of another source leaves this one idle.
-  assert.equal(M.syncView({ ...running, state: 'done' }, 'city', status).icon, M.Icons.sync);
+  assert.equal(M.syncView(running, null, 'city', status).text, 'Landscape 1,234 / 4,071');
+  assert.equal(M.syncView({ ...running, total: null, done: 0 }, null, 'landscape', status).text, '0 / …');
+  // Finished: a check, no action, and the date it finished.
+  const done = M.syncView(null, { ...running, state: 'done' }, 'landscape', status);
+  assert.deepEqual([done.icon, done.text, done.action], [M.Icons.synced, '', '']);
+  assert.match(done.tooltip, /^1,234 thumbnails synced on \d{4}-\d{2}-\d{2}$/);
+  const stopped = M.syncView(null, { ...running, state: 'stopped' }, 'landscape', status);
+  assert.deepEqual([stopped.text, stopped.action, stopped.tooltip], ['1,234 / 4,071', 'start', 'Sync stopped · click to resume']);
+  const failed = M.syncView(null, { ...running, state: 'failed', error: { code: 'network', message: 'No connection' } }, 'landscape', status);
+  assert.deepEqual([failed.icon, failed.tone, failed.tooltip], [M.Icons.syncAlert, 'error', 'Sync failed: No connection · click to resume']);
+});
+
+test('sync records come from the source entry for the current filters', () => {
+  const withSync = { ...status, sources: [{ ...status.sources[0], sync: { state: 'done', done: 3 } }, status.sources[1]] };
+  assert.equal(M.sourceSync(withSync, 'landscape').state, 'done');
+  assert.equal(M.sourceSync(withSync, 'space'), null);
+  assert.equal(M.sourceSync(null, 'landscape'), null);
+  assert.equal(M.formatDate(null), '');
 });
 
 test('browse rows are flat and typed even for missing fields', () => {
@@ -131,10 +140,34 @@ test('browse rows are flat and typed even for missing fields', () => {
   assert.equal(M.browseRow(null).favs, -1);
 });
 
-test('next page loads well before the bottom', () => {
-  // 1000 px view, 5000 px content: 1500 px left below at contentY 2500.
-  assert.equal(M.nearEnd(2500, 1000, 0, 5000, 1.5), false);
-  assert.equal(M.nearEnd(2600, 1000, 0, 5000, 1.5), true);
-  // Content shorter than the view always wants more.
-  assert.equal(M.nearEnd(0, 1000, 0, 600, 1.5), true);
+test('wheel steps grow with spin speed and reset after a pause', () => {
+  assert.equal(M.wheelSpeed(0, -120, 1000).boost, 1);            // first notch after a pause
+  assert.equal(M.wheelSpeed(0, -120, 250).boost, 1);             // 4 notches/s: normal
+  let s = { avg: 0 };
+  for (let i = 0; i < 6; i++) s = M.wheelSpeed(s.avg, -120, 30); // 33 notches/s: fast spin
+  assert.equal(s.boost, 4);
+  assert.ok(M.wheelSpeed(0, -120, 80).boost > 1 && M.wheelSpeed(0, -120, 80).boost < 2);
+  // A high-resolution wheel sends small deltas often; speed is the same as whole notches.
+  assert.equal(M.wheelSpeed(0, -15, 31.25).boost, 1);
+  assert.equal(M.wheelSpeed(s.avg, -120, 400).boost, 1);         // pause resets
+});
+
+test('pages load where the grid is, then below, then above', () => {
+  // 5 columns, 200 px rows, 600 px view: 4 rows (20 cards) on screen.
+  const at = (contentY, loaded) => M.nextPage(contentY, 0, 600, 5, 200, 4991, 208, loaded);
+  assert.equal(M.nextPage(0, 0, 600, 5, 200, 0, 0, {}), 1);           // nothing yet
+  assert.equal(M.nextPage(0, 0, 600, 5, 200, 0, 0, { 1: true }), 0);  // first page pending total
+  assert.equal(at(0, {}), 1);
+  assert.equal(at(0, { 1: true }), 2);                                // 1.5 screens below reach card 49,
+  assert.equal(at(0, { 1: true, 2: true }), 3);                       // which is on page 3
+  assert.equal(at(0, { 1: true, 2: true, 3: true }), 0);
+  // Dragged to the middle: row 400 starts at card 2000, which is on page 84.
+  assert.equal(M.pageOf(2000), 84);
+  assert.equal(at(80000, { 1: true }), 84);
+  assert.equal(at(80000, { 84: true }), 85);
+  assert.equal(at(80000, { 84: true, 85: true }), 86);                // below first,
+  assert.equal(at(80000, { 84: true, 85: true, 86: true }), 83);      // then one screen above
+  assert.equal(at(80000, { 83: true, 84: true, 85: true, 86: true }), 0);
+  // Never past the last page.
+  assert.equal(M.nextPage(1e9, 0, 600, 5, 200, 4991, 208, {}), 208);
 });

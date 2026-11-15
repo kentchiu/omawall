@@ -14,6 +14,8 @@ optional timer. No API key is needed.
   background while you look at the current one.
 - Sync all thumbnails of a source to disk with the sync icon next to the page counter in the browse view,
   so its pages no longer wait for downloads. It runs in the background; click the icon again to cancel.
+  A finished source keeps a check mark and is not synced again; a stopped one resumes where it left off.
+- Open the thumbnails folder in your file manager with the folder icon next to it.
 - Favorite a wallpaper to keep a copy in `~/Pictures/Wallpapers/wallhaven/`.
 - An applied wallpaper is not picked again until its source has been shown in full.
 - Change the wallpaper on a timer (5–1440 minutes).
