@@ -11,10 +11,9 @@ use crate::config::{self, ColorMode, FAVS, Settings, Source};
 use crate::error::{AppError, Result};
 use crate::image;
 use crate::paths::Paths;
-use crate::select::{self, Exclusions, Rng};
-use crate::state::{
-    self, Current, Disliked, Favorite, Favorites, LastError, Seen, Status, push_unique,
-};
+use crate::select::{self, Rng};
+use crate::state::{self, Current, Favorite, Favorites, LastError, Seen, Status, push_unique};
+use crate::sync::{self, Clock, SystemClock};
 use crate::wallhaven::{self, Item, Query, Transport, UreqTransport};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -42,10 +41,11 @@ pub enum Command {
     Status,
     Next(Trigger),
     Apply(String),
-    Dislike,
     Fav,
     Browse { source: String, page: u64 },
     Set { name: String, value: String },
+    Sync(String),
+    SyncCancel,
 }
 
 impl Command {
@@ -56,7 +56,7 @@ impl Command {
         }
     }
 
-    /// `browse`, `fav` and `set` never notify.
+    /// `browse`, `fav` and `set` never notify (`status` and `sync` never reach this).
     fn notifies(&self) -> bool {
         !matches!(
             self,
@@ -65,7 +65,7 @@ impl Command {
     }
 }
 
-const USAGE: &str = "用法：omawall status | next [--trigger manual|timer] | apply <id> [--trigger manual] | dislike | fav | browse <來源|favs> [--page N] | set <名稱> <值> | --version";
+const USAGE: &str = "Usage: omawall status | next [--trigger manual|timer] | apply <id> [--trigger manual] | fav | browse <source|favs> [--page N] | set <name> <value> | sync <source> | sync --cancel | --version";
 
 fn usage() -> AppError {
     AppError::usage(USAGE)
@@ -84,11 +84,10 @@ pub fn parse_args(args: &[String]) -> Result<Command> {
         }),
         ["apply", id] | ["apply", id, "--trigger", "manual"] => {
             if !wallhaven::is_valid_id(id) {
-                return Err(AppError::usage(format!("桌布 id 無效：{id}")));
+                return Err(AppError::usage(format!("Invalid wallpaper id: {id}")));
             }
             Command::Apply(id.to_string())
         }
-        ["dislike"] => Command::Dislike,
         ["fav"] => Command::Fav,
         ["browse", source] => Command::Browse {
             source: source.to_string(),
@@ -100,12 +99,14 @@ pub fn parse_args(args: &[String]) -> Result<Command> {
                 .parse()
                 .ok()
                 .filter(|&p| p >= 1)
-                .ok_or_else(|| AppError::usage("--page 必須是正整數"))?,
+                .ok_or_else(|| AppError::usage("--page must be a positive integer"))?,
         },
         ["set", name, value] => Command::Set {
             name: name.to_string(),
             value: value.to_string(),
         },
+        ["sync", "--cancel"] => Command::SyncCancel,
+        ["sync", source] => Command::Sync(source.to_string()),
         _ => return Err(usage()),
     };
     Ok(command)
@@ -127,14 +128,14 @@ pub fn render(result: Result<Output>) -> (String, i32) {
     }
 }
 
-fn output(value: Value) -> Output {
+pub(crate) fn output(value: Value) -> Output {
     match value {
         Value::Object(map) => map,
         _ => unreachable!("command outputs are objects"),
     }
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -142,7 +143,7 @@ fn now() -> u64 {
 }
 
 fn no_current() -> AppError {
-    AppError::new("not_found", "目前沒有套用中的桌布")
+    AppError::new("not_found", "No wallpaper is applied")
 }
 
 /// What `next`/`apply` will put on the desktop.
@@ -157,7 +158,6 @@ struct Store {
     sources: Vec<Source>,
     settings: Settings,
     seen: Seen,
-    disliked: Disliked,
     favorites: Favorites,
     status: Status,
 }
@@ -168,6 +168,8 @@ pub struct App {
     pub bg_set: String,
     pub notifier: String,
     pub lock_wait: Duration,
+    pub sync_lock_wait: Duration,
+    pub clock: Box<dyn Clock>,
 }
 
 impl App {
@@ -178,12 +180,18 @@ impl App {
             bg_set: "omarchy-theme-bg-set".into(),
             notifier: "omarchy-notification-send".into(),
             lock_wait: Duration::from_secs(10),
+            sync_lock_wait: Duration::from_secs(2),
+            clock: Box::new(SystemClock::new()),
         }
     }
 
     pub fn run(&self, command: Command) -> Result<Output> {
-        if command == Command::Status {
-            return self.status();
+        // These never take `<state>/lock`, never record `lastError` and never notify.
+        match command {
+            Command::Status => return self.status(),
+            Command::Sync(key) => return sync::sync(self, &key),
+            Command::SyncCancel => return sync::cancel(&self.paths),
+            _ => {}
         }
         let trigger = command.trigger();
         let notifies = command.notifies();
@@ -208,13 +216,14 @@ impl App {
 
     fn dispatch(&self, command: Command) -> Result<Output> {
         match command {
-            Command::Status => self.status(),
             Command::Next(_) => self.next(),
             Command::Apply(id) => self.apply(&id),
-            Command::Dislike => self.dislike(),
             Command::Fav => self.fav(),
             Command::Browse { source, page } => self.browse(&source, page),
             Command::Set { name, value } => self.set(&name, &value),
+            Command::Status | Command::Sync(_) | Command::SyncCancel => {
+                unreachable!("handled in run")
+            }
         }
     }
 
@@ -241,6 +250,7 @@ impl App {
             "settings": s.settings,
             "sources": sources,
             "favorites": {"count": s.favorites.items.len(), "selected": s.settings.is_selected(FAVS)},
+            "sync": sync::status_view(&self.paths)?,
         })))
     }
 
@@ -267,11 +277,7 @@ impl App {
                 continue;
             };
             let query = self.query(source, &s.settings, color);
-            let ex = Exclusions {
-                disliked: &s.disliked,
-                current,
-            };
-            let pick = select::pick_tag(&*self.transport, &query, &mut s.seen, &ex)?;
+            let pick = select::pick_tag(&*self.transport, &query, &mut s.seen, current)?;
             if let Some(total) = pick.total {
                 s.status.totals.insert(query.key(), total);
             }
@@ -289,7 +295,7 @@ impl App {
             self.write_status(&mut s.status)?;
             return Err(AppError::new(
                 "no_candidates",
-                "找不到可用的桌布，請調整來源或篩選條件",
+                "No wallpaper available; adjust sources or filters",
             ));
         };
         let applied = self.apply_target(target)?;
@@ -325,24 +331,11 @@ impl App {
         self.finish_apply(&mut s.status, applied)
     }
 
-    fn dislike(&self) -> Result<Output> {
-        let mut s = self.load()?;
-        let id = s.status.current_id().ok_or_else(no_current)?.to_string();
-        push_unique(&mut s.disliked.ids, &id);
-        self.save(&s.disliked, "disliked.json")?;
-        if s.favorites.contains(&id) {
-            self.remove_favorite(&id, &mut s.favorites, &mut s.status)?;
-            self.save(&s.favorites, "favorites.json")?;
-            self.write_status(&mut s.status)?;
-        }
-        self.next()
-    }
-
     fn fav(&self) -> Result<Output> {
         let mut s = self.load()?;
         let cur = s.status.current.clone().ok_or_else(no_current)?;
         if !wallhaven::is_valid_id(&cur.id) {
-            return Err(AppError::new("io", "status.json 的桌布 id 無效"));
+            return Err(AppError::new("io", "Invalid wallpaper id in status.json"));
         }
         let favorite = if s.favorites.contains(&cur.id) {
             self.remove_favorite(&cur.id, &mut s.favorites, &mut s.status)?;
@@ -350,7 +343,10 @@ impl App {
         } else {
             let src = Path::new(&cur.path);
             if !src.is_file() {
-                return Err(AppError::new("not_found", "找不到目前桌布的圖片檔"));
+                return Err(AppError::new(
+                    "not_found",
+                    "Current wallpaper file not found",
+                ));
             }
             let ext = image::detect_file(src)?;
             let dest = self
@@ -359,7 +355,7 @@ impl App {
                 .join(format!("wallhaven-{}.{ext}", cur.id));
             if dest != src {
                 let bytes = fs::read(src)
-                    .map_err(|e| AppError::io(format!("無法讀取 {}", src.display()), e))?;
+                    .map_err(|e| AppError::io(format!("Cannot read {}", src.display()), e))?;
                 state::write_atomic(&dest, &bytes)?;
             }
             let thumb = self.current_thumb(&cur);
@@ -378,8 +374,6 @@ impl App {
                     added_at: now(),
                 },
             );
-            s.disliked.ids.retain(|x| x != &cur.id);
-            self.save(&s.disliked, "disliked.json")?;
             true
         };
         self.save(&s.favorites, "favorites.json")?;
@@ -400,7 +394,6 @@ impl App {
             json!({
                 "id": id, "thumb": thumb, "resolution": resolution, "favorites": favorites, "fileSize": file_size,
                 "seen": s.seen.all.iter().any(|x| x == id),
-                "disliked": s.disliked.contains(id),
                 "favorite": s.favorites.contains(id),
                 "current": current.as_deref() == Some(id),
             })
@@ -432,13 +425,14 @@ impl App {
             .sources
             .iter()
             .find(|src| src.key == key)
-            .ok_or_else(|| AppError::usage(format!("未知的來源：{key}")))?;
+            .ok_or_else(|| AppError::usage(format!("Unknown source: {key}")))?;
         let query = self.query(source, &s.settings, self.color(&s.settings));
         let result = wallhaven::search(&*self.transport, &query, page)?;
+        let thumbs =
+            image::ensure_thumbs(&*self.transport, &result.items, &self.paths.thumbs_dir());
         let mut items = Vec::with_capacity(result.items.len());
-        for item in &result.items {
-            let thumb = match image::ensure_thumb(&*self.transport, item, &self.paths.thumbs_dir())
-            {
+        for (item, thumb) in result.items.iter().zip(thumbs) {
+            let thumb = match thumb {
                 Ok(path) => Some(path.display().to_string()),
                 Err(e) if matches!(e.code, "network" | "timeout" | "rate_limited" | "io") => {
                     return Err(e);
@@ -479,7 +473,6 @@ impl App {
             sources,
             settings,
             seen: state::read_json(&self.paths.state("seen.json"))?,
-            disliked: state::read_json(&self.paths.state("disliked.json"))?,
             favorites: state::read_json(&self.paths.state("favorites.json"))?,
             status: state::read_json(&self.paths.state("status.json"))?,
         })
@@ -494,14 +487,19 @@ impl App {
         self.save(status, "status.json")
     }
 
-    fn color(&self, settings: &Settings) -> Option<&'static str> {
+    pub(crate) fn color(&self, settings: &Settings) -> Option<&'static str> {
         match settings.color {
             ColorMode::Theme => color::theme_color(&self.paths.theme_colors),
             ColorMode::None => None,
         }
     }
 
-    fn query(&self, source: &Source, settings: &Settings, color: Option<&'static str>) -> Query {
+    pub(crate) fn query(
+        &self,
+        source: &Source,
+        settings: &Settings,
+        color: Option<&'static str>,
+    ) -> Query {
         Query {
             tag: source.tag,
             categories: settings.categories(),
@@ -564,12 +562,12 @@ impl App {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .status()
-            .map_err(|e| AppError::new("set_failed", format!("無法執行 {}：{e}", self.bg_set)))?;
+            .map_err(|e| AppError::new("set_failed", format!("Cannot run {}: {e}", self.bg_set)))?;
         if !status.success() {
-            let code = status.code().map_or("無".to_string(), |c| c.to_string());
+            let code = status.code().map_or("none".to_string(), |c| c.to_string());
             return Err(AppError::new(
                 "set_failed",
-                format!("{} 執行失敗（結束代碼 {code}）", self.bg_set),
+                format!("{} failed (exit code {code})", self.bg_set),
             ));
         }
         Ok(())
@@ -606,7 +604,7 @@ impl App {
             if !file.is_file() {
                 continue;
             }
-            let io = |e| AppError::io(format!("無法處理 {}", file.display()), e);
+            let io = |e| AppError::io(format!("Cannot update {}", file.display()), e);
             if let Some(cur) = status
                 .current
                 .as_mut()
@@ -641,7 +639,7 @@ impl App {
 
     fn notify(&self, message: &str) {
         let _ = Process::new(&self.notifier)
-            .args(["--app-name", "omawall", "換桌布失敗", message])
+            .args(["--app-name", "omawall", "Wallpaper change failed", message])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -650,7 +648,7 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::testutil::{FakeTransport, JPEG, PNG, temp_dir};
     use crate::wallhaven::tests::{item_json, search_json};
@@ -659,7 +657,7 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
-    fn test_app(name: &str, transport: FakeTransport) -> App {
+    pub fn test_app(name: &str, transport: FakeTransport) -> App {
         let root = temp_dir(name);
         let paths = Paths::new(
             &root.join("home"),
@@ -674,6 +672,8 @@ mod tests {
             notifier: "true".into(),
             // Parallel tests fork children that briefly inherit lock fds, so allow a wait.
             lock_wait: Duration::from_secs(5),
+            sync_lock_wait: Duration::from_secs(2),
+            clock: Box::new(crate::testutil::FakeClock::default()),
         }
     }
 
@@ -699,7 +699,7 @@ mod tests {
         t
     }
 
-    fn run(app: &App, list: &[&str]) -> Result<Output> {
+    pub fn run(app: &App, list: &[&str]) -> Result<Output> {
         app.run(parse_args(&args(list))?)
     }
 
@@ -728,6 +728,14 @@ mod tests {
             parse_args(&args(&["apply", "abc", "--trigger", "manual"])).unwrap(),
             Command::Apply("abc".into())
         );
+        assert_eq!(
+            parse_args(&args(&["sync", "landscape"])).unwrap(),
+            Command::Sync("landscape".into())
+        );
+        assert_eq!(
+            parse_args(&args(&["sync", "--cancel"])).unwrap(),
+            Command::SyncCancel
+        );
         for bad in [
             &[][..],
             &["nope"],
@@ -737,6 +745,9 @@ mod tests {
             &["browse", "favs", "--page", "0"],
             &["set", "color"],
             &["status", "extra"],
+            &["dislike"],
+            &["sync"],
+            &["sync", "landscape", "--cancel"],
         ] {
             assert_eq!(parse_args(&args(bad)).unwrap_err().code, "usage", "{bad:?}");
         }
@@ -770,9 +781,10 @@ mod tests {
         assert_eq!(out["sources"].as_array().unwrap().len(), 10);
         assert_eq!(
             out["sources"][0],
-            json!({"key":"landscape","label":"風景","tag":711,"selected":true,"total":null})
+            json!({"key":"landscape","label":"Landscape","tag":711,"selected":true,"total":null})
         );
         assert_eq!(out["favorites"], json!({"count": 0, "selected": false}));
+        assert_eq!(out["sync"], Value::Null);
         assert_eq!(out["settings"]["timer"]["minutes"], 60);
     }
 
@@ -854,48 +866,37 @@ mod tests {
     }
 
     #[test]
-    fn fav_and_dislike_are_exclusive() {
+    fn fav_toggles_and_ignores_legacy_dislikes() {
         let app = test_app("app-fav", landscape(&["aa1", "aa2", "aa3"]));
         run(&app, &["set", "sources", "landscape"]).unwrap();
         assert_eq!(run(&app, &["fav"]).unwrap_err().code, "not_found");
-        run(&app, &["next"]).unwrap();
+        // A 0.1.x disliked.json is neither read nor written.
+        let legacy = app.paths.state("disliked.json");
+        fs::write(&legacy, r#"{"version":1,"ids":["aa1"]}"#).unwrap();
+        assert_eq!(run(&app, &["next"]).unwrap()["current"]["id"], "aa1");
 
-        // Disliked id that becomes a favorite leaves the dislike list.
-        state::write_json(
-            &app.paths.state("disliked.json"),
-            &Disliked {
-                version: 1,
-                ids: vec!["aa1".into()],
-            },
-        )
-        .unwrap();
         let out = run(&app, &["fav"]).unwrap();
         assert_eq!(out["favorite"], true);
         let fav_file = app.paths.favorites_dir.join("wallhaven-aa1.jpg");
         assert!(fav_file.is_file());
-        let disliked: Disliked = state::read_json(&app.paths.state("disliked.json")).unwrap();
-        assert!(disliked.ids.is_empty());
         let favorites: Favorites = state::read_json(&app.paths.state("favorites.json")).unwrap();
         assert_eq!(favorites.items[0].id, "aa1");
-
-        // Toggle off and on again.
-        assert_eq!(run(&app, &["fav"]).unwrap()["favorite"], false);
-        assert!(!fav_file.exists());
-        assert_eq!(run(&app, &["fav"]).unwrap()["favorite"], true);
 
         // A stray file not matching the pattern is never touched.
         let stray = app.paths.favorites_dir.join("aa1.jpg");
         fs::write(&stray, JPEG).unwrap();
 
-        // Dislike removes the favorite copy and entry, then moves on.
-        let out = run(&app, &["dislike"]).unwrap();
-        assert_eq!(out["current"]["id"], "aa2");
+        // Toggle off and on again.
+        assert_eq!(run(&app, &["fav"]).unwrap()["favorite"], false);
         assert!(!fav_file.exists());
         assert!(stray.exists());
         let favorites: Favorites = state::read_json(&app.paths.state("favorites.json")).unwrap();
         assert!(favorites.items.is_empty());
-        let disliked: Disliked = state::read_json(&app.paths.state("disliked.json")).unwrap();
-        assert_eq!(disliked.ids, ["aa1"]);
+        assert_eq!(run(&app, &["fav"]).unwrap()["favorite"], true);
+        assert_eq!(
+            fs::read_to_string(&legacy).unwrap(),
+            r#"{"version":1,"ids":["aa1"]}"#
+        );
     }
 
     #[test]
@@ -952,6 +953,7 @@ mod tests {
             (first["seen"].clone(), first["current"].clone()),
             (json!(false), json!(false))
         );
+        assert!(first.get("disliked").is_none());
         assert_eq!(status_of(&app).totals["tag:711|cat:100|color:none"], 2);
         assert_eq!(run(&app, &["browse", "nope"]).unwrap_err().code, "usage");
 

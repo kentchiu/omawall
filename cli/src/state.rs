@@ -13,10 +13,11 @@ use crate::error::{AppError, Result};
 /// Reads a JSON state file; a missing file yields the default value.
 pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|e| AppError::new("io", format!("狀態檔損毀 {}：{e}", path.display()))),
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            AppError::new("io", format!("Corrupt state file {}: {e}", path.display()))
+        }),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(T::default()),
-        Err(e) => Err(AppError::io(format!("無法讀取 {}", path.display()), e)),
+        Err(e) => Err(AppError::io(format!("Cannot read {}", path.display()), e)),
     }
 }
 
@@ -28,7 +29,7 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 /// Writes via a temp file in the same directory, then renames over the target.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let fail = |e| AppError::io(format!("無法寫入 {}", path.display()), e);
+    let fail = |e| AppError::io(format!("Cannot write {}", path.display()), e);
     let dir = path.parent().expect("state paths have a parent");
     fs::create_dir_all(dir).map_err(fail)?;
     let name = path
@@ -52,8 +53,13 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 pub struct Lock(#[allow(dead_code)] File);
 
 pub fn acquire_lock(state_dir: &Path, wait: Duration) -> Result<Lock> {
-    let path = state_dir.join("lock");
-    let fail = |e| AppError::io(format!("無法開啟鎖定檔 {}", path.display()), e);
+    acquire_named_lock(state_dir, "lock", wait)
+}
+
+/// Exclusive lock on `<state_dir>/<name>`; waits up to `wait`, then `busy`.
+pub fn acquire_named_lock(state_dir: &Path, name: &str, wait: Duration) -> Result<Lock> {
+    let path = state_dir.join(name);
+    let fail = |e| AppError::io(format!("Cannot open lock file {}", path.display()), e);
     fs::create_dir_all(state_dir).map_err(fail)?;
     let file = File::options()
         .create(true)
@@ -69,14 +75,19 @@ pub fn acquire_lock(state_dir: &Path, wait: Duration) -> Result<Lock> {
                 thread::sleep(Duration::from_millis(100));
             }
             Err(fs::TryLockError::WouldBlock) => {
-                return Err(AppError::new(
-                    "busy",
-                    "omawall 正在執行其他工作，請稍後再試",
-                ));
+                return Err(AppError::new("busy", "omawall is busy; try again later"));
             }
             Err(fs::TryLockError::Error(e)) => return Err(fail(e)),
         }
     }
+}
+
+/// Whether another open file currently holds the lock on `path` (a missing file is free).
+pub fn is_locked(path: &Path) -> bool {
+    let Ok(file) = File::options().write(true).open(path) else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock))
 }
 
 fn v1() -> u32 {
@@ -112,28 +123,6 @@ impl Default for Seen {
 pub fn push_unique(list: &mut Vec<String>, id: &str) {
     if !list.iter().any(|x| x == id) {
         list.push(id.to_string());
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Disliked {
-    pub version: u32,
-    pub ids: Vec<String>,
-}
-
-impl Default for Disliked {
-    fn default() -> Self {
-        Self {
-            version: v1(),
-            ids: Vec::new(),
-        }
-    }
-}
-
-impl Disliked {
-    pub fn contains(&self, id: &str) -> bool {
-        self.ids.iter().any(|x| x == id)
     }
 }
 
@@ -250,8 +239,16 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.code, "busy");
+        assert!(is_locked(&dir.join("lock")));
         drop(held);
-        assert!(acquire_lock(&dir, Duration::ZERO).is_ok());
+        // Children forked by parallel tests may briefly inherit the fd, so poll.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_locked(&dir.join("lock")) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!is_locked(&dir.join("lock")));
+        assert!(!is_locked(&dir.join("missing.lock")));
+        assert!(acquire_lock(&dir, Duration::from_secs(5)).is_ok());
     }
 
     #[test]

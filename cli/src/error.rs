@@ -1,6 +1,6 @@
 use std::fmt;
 
-/// A user-facing failure: a stable machine code plus a Traditional Chinese message.
+/// A user-facing failure: a stable machine code plus an English message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppError {
     pub code: &'static str,
@@ -22,7 +22,7 @@ impl AppError {
     }
 
     pub fn io(context: impl fmt::Display, err: std::io::Error) -> Self {
-        Self::new("io", format!("{context}：{err}"))
+        Self::new("io", format!("{context}: {err}"))
     }
 
     pub fn exit_code(&self) -> i32 {

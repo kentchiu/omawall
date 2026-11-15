@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "kent.omawall",
   "name": "omawall",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Kent Chiu",
   "description": "Wallhaven wallpapers for Omarchy: multi-source rotation, favorites, browsing and a timer.",
   "kinds": [
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "omawall",
-    "description": "Next wallpaper, sources, favorites and full-screen browsing",
+    "description": "Next wallpaper, sources, favorites, browsing and thumbnail sync",
     "category": "Appearance",
     "allowMultiple": false,
     "defaultSection": "right"

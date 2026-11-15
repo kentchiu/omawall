@@ -6,12 +6,14 @@ var Icons = {
   wallpaper: "\uDB83\uDE09",   // md-wallpaper
   next: "\uDB81\uDCAD",        // md-skip_next
   browse: "\uDB80\uDEF9",      // md-image_multiple
-  dislike: "\uDB81\uDD12",     // md-thumb_down_outline
   fav: "\uDB80\uDED5",         // md-heart_outline
   faved: "\uDB80\uDED1",       // md-heart
   open: "\uDB80\uDFCC",        // md-open_in_new
   alert: "\uDB80\uDC28",       // md-alert_circle
-  timer: "\uDB81\uDD1B"        // md-timer_outline
+  timer: "\uDB81\uDD1B",       // md-timer_outline
+  sync: "\uDB81\uDCE6",        // md-sync
+  syncAlert: "\uDB81\uDCE7",   // md-sync_alert
+  synced: "\uDB81\uDDE1"       // md-check_circle_outline
 }
 
 var MIN_MINUTES = 5
@@ -21,16 +23,16 @@ var FAVS = "favs"
 // Parse one CLI stdout payload. Never throws; malformed output becomes an error result.
 function parseResult(text) {
   var raw = String(text || "").trim()
-  if (!raw) return { ok: false, error: { code: "invalid_response", message: "omawall 沒有輸出結果。" } }
+  if (!raw) return { ok: false, error: { code: "invalid_response", message: "omawall printed nothing." } }
   try {
     var parsed = JSON.parse(raw)
     if (parsed && typeof parsed === "object" && typeof parsed.ok === "boolean") {
       if (!parsed.ok && !(parsed.error && typeof parsed.error.message === "string"))
-        parsed.error = { code: "invalid_response", message: "omawall 回傳的錯誤格式無效。" }
+        parsed.error = { code: "invalid_response", message: "omawall returned a malformed error." }
       return parsed
     }
   } catch (e) {}
-  return { ok: false, error: { code: "invalid_response", message: "omawall 回傳的格式無效。" } }
+  return { ok: false, error: { code: "invalid_response", message: "omawall returned malformed output." } }
 }
 
 function formatCount(n) {
@@ -60,7 +62,7 @@ function fileUrl(path) {
 }
 
 function sourceLabel(status, key) {
-  if (key === FAVS) return "收藏"
+  if (key === FAVS) return "Favorites"
   // `apply` from the browse overlay records no source.
   if (!key) return "Wallhaven"
   var sources = status && status.sources ? status.sources : []
@@ -126,7 +128,7 @@ function browseTabs(status) {
   for (var i = 0; i < sources.length; i++)
     tabs.push({ key: sources[i].key, label: String(sources[i].label), count: sources[i].total, selected: !!sources[i].selected })
   var favs = status && status.favorites ? status.favorites : { count: 0, selected: false }
-  tabs.push({ key: FAVS, label: "收藏", count: favs.count || 0, selected: !!favs.selected })
+  tabs.push({ key: FAVS, label: "Favorites", count: favs.count || 0, selected: !!favs.selected })
   return tabs
 }
 
@@ -155,12 +157,12 @@ function timerSettings(text) {
 
 function timerText(settings) {
   var timer = settings && settings.timer ? settings.timer : null
-  if (!timer || !timer.enabled) return "已關閉"
-  return "每 " + formatCount(clampMinutes(timer.minutes)) + " 分鐘"
+  if (!timer || !timer.enabled) return "Off"
+  return "Every " + formatCount(clampMinutes(timer.minutes)) + " min"
 }
 
 function colorText(settings) {
-  return settings && settings.color === "theme" ? "跟隨主題 accent" : "不篩色"
+  return settings && settings.color === "theme" ? "Theme accent" : "Any color"
 }
 
 function stylesText(settings) {
@@ -168,18 +170,67 @@ function stylesText(settings) {
   var names = []
   if (styles.general) names.push("General")
   if (styles.anime) names.push("Anime")
-  return names.join("＋")
+  return names.join(" + ")
 }
 
 // Banner for the popup: CLI missing or outdated wins over the last command error.
 function banner(cliState, status, pluginVersion) {
   if (cliState === "missing")
-    return { tone: "error", text: "找不到 omawall CLI，請在 repo 執行 scripts/install-cli。" }
+    return { tone: "error", text: "omawall CLI not found. Run scripts/install-cli from the plugin folder." }
   if (cliState === "broken")
-    return { tone: "error", text: "omawall CLI 無法執行或回應格式無效。" }
+    return { tone: "error", text: "omawall CLI failed to run or returned malformed output." }
   if (status && pluginVersion && status.version && status.version !== pluginVersion)
-    return { tone: "error", text: "CLI 版本 " + status.version + " 與 plugin " + pluginVersion + " 不一致，請重新執行 scripts/install-cli。" }
+    return { tone: "error", text: "CLI " + status.version + " does not match plugin " + pluginVersion + ". Run scripts/install-cli again." }
   var err = status && status.status ? status.status.lastError : null
   if (!err || typeof err.message !== "string") return null
   return { tone: err.code === "rate_limited" ? "warn" : "error", text: err.message }
+}
+
+// Sync control next to the page counter in the browse view, for a tag source.
+// Only one sync runs at a time, so a running sync of another source offers Cancel too.
+function syncView(sync, key, status) {
+  if (!key || key === FAVS) return null
+  var label = function(k) { return sourceLabel(status, k) || k }
+  var progress = sync ? formatCount(sync.done) + " / " + (typeof sync.total === "number" ? formatCount(sync.total) : "…") : ""
+  var view = { icon: Icons.sync, text: "", tooltip: "Sync all " + label(key) + " thumbnails", action: "start", tone: "normal", spinning: false }
+  if (sync && sync.state === "running") {
+    var here = sync.source === key
+    view.text = here ? progress : label(sync.source) + " " + progress
+    view.tooltip = here ? "Cancel sync" : "Cancel " + label(sync.source) + " sync"
+    view.action = "cancel"
+    view.spinning = true
+  } else if (sync && sync.source === key) {
+    if (sync.state === "done") {
+      view.icon = Icons.synced
+      view.tooltip = formatCount(sync.done) + " thumbnails synced · click to sync again"
+    } else if (sync.state === "failed") {
+      view.icon = Icons.syncAlert
+      view.tone = "error"
+      view.tooltip = "Sync failed: " + (sync.error && typeof sync.error.message === "string" ? sync.error.message : "unknown error") + " · click to retry"
+    } else if (sync.state === "canceled" || sync.state === "stopped") {
+      view.text = progress
+      view.tooltip = "Sync stopped · click to resume"
+    }
+  }
+  return view
+}
+
+// One browse card as a flat ListModel row; null and missing fields get typed defaults
+// so the first row fixes each role's type. `id` cannot be a QML property, hence `wid`.
+function browseRow(item) {
+  return {
+    wid: String(item && item.id || ""),
+    thumb: item && typeof item.thumb === "string" ? item.thumb : "",
+    resolution: String(item && item.resolution || ""),
+    favs: item && typeof item.favorites === "number" ? item.favorites : -1,
+    size: item && typeof item.fileSize === "number" ? item.fileSize : -1,
+    seen: !!(item && item.seen),
+    fav: !!(item && item.favorite),
+    current: !!(item && item.current)
+  }
+}
+
+// True when less than `screens` viewport heights of content remain below the view.
+function nearEnd(contentY, height, originY, contentHeight, screens) {
+  return originY + contentHeight - (contentY + height) < height * screens
 }

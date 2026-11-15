@@ -7,6 +7,7 @@ mod image;
 mod paths;
 mod select;
 mod state;
+mod sync;
 #[cfg(test)]
 mod testutil;
 mod wallhaven;

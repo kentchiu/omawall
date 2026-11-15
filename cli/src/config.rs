@@ -20,16 +20,16 @@ struct ConfigFile {
 }
 
 const DEFAULT_SOURCES: [(&str, &str, u64); 10] = [
-    ("landscape", "風景", 711),
-    ("nature", "自然", 37),
-    ("space", "太空", 32),
-    ("city", "城市", 17),
-    ("mountains", "山岳", 328),
-    ("architecture", "建築", 989),
-    ("minimalism", "極簡", 2278),
-    ("abstract", "抽象", 74),
-    ("digital-art", "數位藝術", 479),
-    ("cars", "汽車", 314),
+    ("landscape", "Landscape", 711),
+    ("nature", "Nature", 37),
+    ("space", "Space", 32),
+    ("city", "City", 17),
+    ("mountains", "Mountains", 328),
+    ("architecture", "Architecture", 989),
+    ("minimalism", "Minimalism", 2278),
+    ("abstract", "Abstract", 74),
+    ("digital-art", "Digital Art", 479),
+    ("cars", "Cars", 314),
 ];
 
 pub fn default_sources() -> Vec<Source> {
@@ -50,13 +50,13 @@ pub fn load_sources(path: &Path) -> Result<Vec<Source>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(default_sources()),
         Err(e) => {
             return Err(AppError::io(
-                format!("無法讀取設定檔 {}", path.display()),
+                format!("Cannot read config file {}", path.display()),
                 e,
             ));
         }
     };
     let file: ConfigFile = serde_json::from_str(&text)
-        .map_err(|e| AppError::new("config", format!("設定檔格式錯誤：{e}")))?;
+        .map_err(|e| AppError::new("config", format!("Invalid config file: {e}")))?;
     validate_sources(&file.sources)?;
     Ok(file.sources)
 }
@@ -70,22 +70,26 @@ fn is_valid_key(key: &str) -> bool {
 
 pub fn validate_sources(sources: &[Source]) -> Result<()> {
     for (i, source) in sources.iter().enumerate() {
-        let fail =
-            |why: &str| AppError::new("config", format!("來源「{}」無效：{why}", source.key));
+        let fail = |why: &str| {
+            AppError::new(
+                "config",
+                format!("Invalid source \"{}\": {why}", source.key),
+            )
+        };
         if !is_valid_key(&source.key) {
-            return Err(fail("key 只能使用 a-z、0-9、-，長度 1–32"));
+            return Err(fail("key must be 1-32 characters of a-z, 0-9 or -"));
         }
         if source.key == FAVS {
-            return Err(fail("favs 為保留字"));
+            return Err(fail("favs is reserved"));
         }
         if sources[..i].iter().any(|s| s.key == source.key) {
-            return Err(fail("key 重複"));
+            return Err(fail("duplicate key"));
         }
         if source.label.trim().is_empty() {
-            return Err(fail("label 不可為空"));
+            return Err(fail("label must not be empty"));
         }
         if source.tag == 0 {
-            return Err(fail("tag 必須是正整數"));
+            return Err(fail("tag must be a positive integer"));
         }
     }
     Ok(())
@@ -164,7 +168,7 @@ impl Settings {
         {
             return Err(AppError::new(
                 "io",
-                format!("狀態檔內容無效：{}", path.display()),
+                format!("Invalid state file: {}", path.display()),
             ));
         }
         Ok(settings)
@@ -190,7 +194,7 @@ impl Settings {
                 let mut keys: Vec<String> = Vec::new();
                 for key in value.split(',').map(str::trim).filter(|k| !k.is_empty()) {
                     if key != FAVS && !sources.iter().any(|s| s.key == key) {
-                        return Err(AppError::usage(format!("未知的來源：{key}")));
+                        return Err(AppError::usage(format!("Unknown source: {key}")));
                     }
                     if !keys.iter().any(|k| k == key) {
                         keys.push(key.to_string());
@@ -207,7 +211,7 @@ impl Settings {
                     styles.anime = on;
                 }
                 if !(styles.general || styles.anime) {
-                    return Err(AppError::usage("至少要保留一種風格"));
+                    return Err(AppError::usage("At least one style must stay on"));
                 }
                 self.styles = styles;
             }
@@ -215,7 +219,7 @@ impl Settings {
                 self.color = match value {
                     "none" => ColorMode::None,
                     "theme" => ColorMode::Theme,
-                    _ => return Err(AppError::usage("color 只能是 none 或 theme")),
+                    _ => return Err(AppError::usage("color must be none or theme")),
                 };
             }
             "timer.enabled" => self.timer.enabled = parse_bool(value)?,
@@ -224,10 +228,12 @@ impl Settings {
                     .parse::<u32>()
                     .ok()
                     .filter(|m| MINUTES.contains(m))
-                    .ok_or_else(|| AppError::usage("timer.minutes 必須是 5–1440 的整數"))?;
+                    .ok_or_else(|| {
+                        AppError::usage("timer.minutes must be an integer from 5 to 1440")
+                    })?;
                 self.timer.minutes = minutes;
             }
-            _ => return Err(AppError::usage(format!("未知的設定：{name}"))),
+            _ => return Err(AppError::usage(format!("Unknown setting: {name}"))),
         }
         Ok(())
     }
@@ -237,7 +243,7 @@ fn parse_bool(value: &str) -> Result<bool> {
     match value {
         "true" => Ok(true),
         "false" => Ok(false),
-        _ => Err(AppError::usage("值只能是 true 或 false")),
+        _ => Err(AppError::usage("Value must be true or false")),
     }
 }
 

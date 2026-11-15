@@ -17,7 +17,8 @@ const THUMB_PREFIX: &str = "https://th.wallhaven.cc/lg/";
 
 /// Minimal HTTP GET. Returns the status code and at most `limit` + 1 body bytes
 /// (or a `too_large` error); must never follow redirects.
-pub trait Transport {
+/// `Sync` so a page of thumbnails can download on several threads.
+pub trait Transport: Sync {
     fn get(&self, url: &str, timeout: Duration, limit: u64) -> Result<(u16, Vec<u8>)>;
 }
 
@@ -66,24 +67,27 @@ fn map_ureq_error(err: ureq::Error) -> AppError {
         ureq::Error::Timeout(_) => timeout_error(),
         ureq::Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut => timeout_error(),
         ureq::Error::BodyExceedsLimit(_) => too_large(),
-        other => AppError::new("network", format!("無法連線 Wallhaven：{other}")),
+        other => AppError::new("network", format!("Cannot reach Wallhaven: {other}")),
     }
 }
 
 fn timeout_error() -> AppError {
-    AppError::new("timeout", "無法連線 Wallhaven（逾時）")
+    AppError::new("timeout", "Wallhaven timed out")
 }
 
 fn too_large() -> AppError {
-    AppError::new("too_large", "下載內容超過大小上限")
+    AppError::new("too_large", "Download exceeds the size limit")
 }
 
 fn http_error(status: u16) -> AppError {
-    AppError::new("http", format!("Wallhaven 回應 HTTP {status}"))
+    AppError::new("http", format!("Wallhaven returned HTTP {status}"))
 }
 
 pub fn invalid_response(why: &str) -> AppError {
-    AppError::new("invalid_response", format!("Wallhaven 回應格式錯誤：{why}"))
+    AppError::new(
+        "invalid_response",
+        format!("Invalid Wallhaven response: {why}"),
+    )
 }
 
 pub fn is_valid_id(id: &str) -> bool {
@@ -110,7 +114,7 @@ pub fn fetch(
     limit: u64,
 ) -> Result<Vec<u8>> {
     if !is_allowed_url(url) {
-        return Err(invalid_response("不允許的網址"));
+        return Err(invalid_response("URL not allowed"));
     }
     let (status, body) = transport.get(url, timeout, limit)?;
     match status {
@@ -118,7 +122,7 @@ pub fn fetch(
         429 => {
             return Err(AppError::new(
                 "rate_limited",
-                "Wallhaven 請求過於頻繁，請稍後再試",
+                "Too many Wallhaven requests; try again later",
             ));
         }
         _ => return Err(http_error(status)),
@@ -214,13 +218,13 @@ struct RawDetail {
 
 fn validate(raw: RawItem) -> Result<Item> {
     if !is_valid_id(&raw.id) {
-        return Err(invalid_response("id 無效"));
+        return Err(invalid_response("invalid id"));
     }
     if !raw.path.starts_with(FULL_PREFIX) || !is_allowed_url(&raw.path) {
-        return Err(invalid_response("圖片網址無效"));
+        return Err(invalid_response("invalid image URL"));
     }
     if !raw.thumbs.large.starts_with(THUMB_PREFIX) || !is_allowed_url(&raw.thumbs.large) {
-        return Err(invalid_response("縮圖網址無效"));
+        return Err(invalid_response("invalid thumbnail URL"));
     }
     Ok(Item {
         id: raw.id,
@@ -247,7 +251,7 @@ pub fn parse_detail(bytes: &[u8], id: &str) -> Result<Item> {
         serde_json::from_slice(bytes).map_err(|e| invalid_response(&e.to_string()))?;
     let item = validate(raw.data)?;
     if item.id != id {
-        return Err(invalid_response("id 不符"));
+        return Err(invalid_response("id mismatch"));
     }
     Ok(item)
 }
@@ -262,7 +266,7 @@ pub fn detail(transport: &dyn Transport, id: &str) -> Result<Item> {
         Ok(bytes) => parse_detail(&bytes, id),
         Err(e) if e == http_error(404) => Err(AppError::new(
             "not_found",
-            format!("Wallhaven 找不到桌布 {id}"),
+            format!("Wallpaper {id} not found on Wallhaven"),
         )),
         Err(e) => Err(e),
     }

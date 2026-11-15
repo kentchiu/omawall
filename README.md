@@ -1,10 +1,8 @@
 # omawall
 
 Wallhaven wallpapers for [Omarchy](https://omarchy.org). A bar widget that rotates SFW, 4K 16:9
-wallpapers from [Wallhaven](https://wallhaven.cc) tags, with favorites, a dislike list, full-screen
-browsing and an optional timer. No API key is needed.
-
-> The UI text is in Traditional Chinese.
+wallpapers from [Wallhaven](https://wallhaven.cc) tags, with favorites, a browse view and an
+optional timer. No API key is needed.
 
 ## Features
 
@@ -12,8 +10,12 @@ browsing and an optional timer. No API key is needed.
 - Pick any mix of sources: 10 Wallhaven tags (landscape, nature, space, city, mountains,
   architecture, minimalism, abstract, digital art, cars) plus your local favorites.
 - Filter by style (General / Anime) and optionally by the current theme's accent color.
-- Browse every source in a full-screen grid and click a thumbnail to apply it.
-- Favorite a wallpaper to keep a copy in `~/Pictures/Wallpapers/wallhaven/`; dislike one to never see it again.
+- Browse every source in a grid and click a thumbnail to apply it. The next page loads in the
+  background while you look at the current one.
+- Sync all thumbnails of a source to disk with the sync icon next to the page counter in the browse view,
+  so its pages no longer wait for downloads. It runs in the background; click the icon again to cancel.
+- Favorite a wallpaper to keep a copy in `~/Pictures/Wallpapers/wallhaven/`.
+- An applied wallpaper is not picked again until its source has been shown in full.
 - Change the wallpaper on a timer (5–1440 minutes).
 
 ## Requirements

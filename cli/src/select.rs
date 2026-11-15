@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::Result;
-use crate::state::{Disliked, Favorite, Favorites, QueryCursor, Seen, push_unique};
+use crate::state::{Favorite, Favorites, QueryCursor, Seen, push_unique};
 use crate::wallhaven::{self, Item, Query, Transport};
 
 const MAX_PAGE_FETCHES: usize = 3;
@@ -45,12 +45,6 @@ impl Rng {
     }
 }
 
-/// What the selection may not pick.
-pub struct Exclusions<'a> {
-    pub disliked: &'a Disliked,
-    pub current: Option<&'a str>,
-}
-
 /// Outcome of scanning one tag query.
 pub struct TagPick {
     pub item: Option<Item>,
@@ -58,13 +52,14 @@ pub struct TagPick {
     pub total: Option<u64>,
 }
 
-/// Walks the query cursor (at most 3 fetches, one reset past `last_page`) and
-/// records the picked id in the cursor and in `seen.all`.
+/// Walks the query cursor (at most 3 fetches, one reset past `last_page`), skipping
+/// ids in `seen.all` before the reset and the `current` id, and records the picked id in the
+/// cursor and in `seen.all`.
 pub fn pick_tag(
     transport: &dyn Transport,
     query: &Query,
     seen: &mut Seen,
-    ex: &Exclusions,
+    current: Option<&str>,
 ) -> Result<TagPick> {
     let cursor = seen
         .queries
@@ -99,8 +94,10 @@ pub fn pick_tag(
         last_page = Some(result.last_page);
         let found = result.items.into_iter().find(|item| {
             !cursor.ids.contains(&item.id)
-                && !ex.disliked.contains(&item.id)
-                && ex.current != Some(item.id.as_str())
+                // Tags overlap and every filter change starts a new query, so ids shown
+                // anywhere are skipped too, until this query wraps around.
+                && (reset_done || !seen.all.contains(&item.id))
+                && current != Some(item.id.as_str())
                 && item.file_size <= wallhaven::FULL_LIMIT
         });
         if let Some(item) = found {
@@ -164,13 +161,6 @@ mod tests {
         query().url(page)
     }
 
-    fn no_ex(disliked: &Disliked) -> Exclusions<'_> {
-        Exclusions {
-            disliked,
-            current: None,
-        }
-    }
-
     #[test]
     fn shuffle_is_permutation() {
         let mut rng = Rng::seeded(42);
@@ -187,10 +177,9 @@ mod tests {
         t.add(&page_url(1), 200, search_json(&["aa1", "aa2"], 2, 4));
         t.add(&page_url(2), 200, search_json(&["bb1", "bb2"], 2, 4));
         let mut seen = Seen::default();
-        let disliked = Disliked::default();
         let mut picks = Vec::new();
         for _ in 0..4 {
-            let pick = pick_tag(&t, &query(), &mut seen, &no_ex(&disliked)).unwrap();
+            let pick = pick_tag(&t, &query(), &mut seen, None).unwrap();
             assert_eq!(pick.total, Some(4));
             picks.push(pick.item.unwrap().id);
         }
@@ -213,8 +202,7 @@ mod tests {
                 ids: vec!["aa1".into(), "aa2".into(), "bb1".into(), "bb2".into()],
             },
         );
-        let disliked = Disliked::default();
-        let pick = pick_tag(&t, &query(), &mut seen, &no_ex(&disliked)).unwrap();
+        let pick = pick_tag(&t, &query(), &mut seen, None).unwrap();
         assert_eq!(pick.item.unwrap().id, "aa1");
         let cursor = &seen.queries[&query().key()];
         assert_eq!(
@@ -226,29 +214,17 @@ mod tests {
     }
 
     #[test]
-    fn skips_disliked_and_current_and_gives_up() {
+    fn skips_current_and_gives_up() {
         let t = FakeTransport::default();
-        t.add(&page_url(1), 200, search_json(&["aa1", "aa2"], 1, 2));
-        t.add(&page_url(2), 200, search_json(&[], 1, 2));
+        t.add(&page_url(1), 200, search_json(&["aa2"], 1, 1));
+        t.add(&page_url(2), 200, search_json(&[], 1, 1));
         let mut seen = Seen::default();
-        let disliked = Disliked {
-            version: 1,
-            ids: vec!["aa1".into()],
-        };
-        let ex = Exclusions {
-            disliked: &disliked,
-            current: Some("aa2"),
-        };
-        let pick = pick_tag(&t, &query(), &mut seen, &ex).unwrap();
+        let pick = pick_tag(&t, &query(), &mut seen, Some("aa2")).unwrap();
         assert!(pick.item.is_none());
         assert_eq!(t.calls().len(), 2, "one reset retry, then stop");
 
-        let ex = Exclusions {
-            disliked: &disliked,
-            current: None,
-        };
         assert_eq!(
-            pick_tag(&t, &query(), &mut seen, &ex)
+            pick_tag(&t, &query(), &mut seen, None)
                 .unwrap()
                 .item
                 .unwrap()
@@ -264,11 +240,7 @@ mod tests {
             t.add(&page_url(p), 200, search_json(&["dd1"], 5, 5));
         }
         let mut seen = Seen::default();
-        let disliked = Disliked {
-            version: 1,
-            ids: vec!["dd1".into()],
-        };
-        let pick = pick_tag(&t, &query(), &mut seen, &no_ex(&disliked)).unwrap();
+        let pick = pick_tag(&t, &query(), &mut seen, Some("dd1")).unwrap();
         assert!(pick.item.is_none());
         assert_eq!(t.calls().len(), 3);
         assert_eq!(seen.queries[&query().key()].page, 4);
@@ -279,11 +251,30 @@ mod tests {
         let t = FakeTransport::default();
         t.add(&page_url(1), 200, search_json(&[], 0, 0));
         let mut seen = Seen::default();
-        let disliked = Disliked::default();
-        let pick = pick_tag(&t, &query(), &mut seen, &no_ex(&disliked)).unwrap();
+        let pick = pick_tag(&t, &query(), &mut seen, None).unwrap();
         assert!(pick.item.is_none());
         assert_eq!(pick.total, Some(0));
         assert_eq!(t.calls().len(), 1);
+    }
+
+    #[test]
+    fn skips_ids_shown_by_other_queries_until_reset() {
+        let t = FakeTransport::default();
+        t.add(&page_url(1), 200, search_json(&["aa1", "aa2"], 1, 2));
+        let mut seen = Seen {
+            all: vec!["aa1".into()],
+            ..Seen::default()
+        };
+        let mut pick = || {
+            pick_tag(&t, &query(), &mut seen, None)
+                .unwrap()
+                .item
+                .map(|item| item.id)
+        };
+        // aa1 was shown from another tag or filter, so this query skips it.
+        assert_eq!(pick().as_deref(), Some("aa2"));
+        // Everything was shown somewhere: after the reset only this query's history counts.
+        assert_eq!(pick().as_deref(), Some("aa1"));
     }
 
     #[test]

@@ -18,7 +18,7 @@ impl Paths {
         let home = env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
-            .ok_or_else(|| AppError::new("io", "找不到 HOME 目錄"))?;
+            .ok_or_else(|| AppError::new("io", "HOME directory not found"))?;
         let config = xdg("XDG_CONFIG_HOME", &home, ".config");
         let state = xdg("XDG_STATE_HOME", &home, ".local/state");
         let cache = xdg("XDG_CACHE_HOME", &home, ".cache");

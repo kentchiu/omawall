@@ -28,12 +28,14 @@ Panel {
 
   property bool browseOpen: false
   property string browseSource: ""
-  property var browseItems: []
   property int browsePage: 0
   property int browseLastPage: 0
   property int browseTotal: 0
   property string browseError: ""
   property bool browseBusy: false
+  // The next page, fetched in the background so scrolling rarely waits.
+  property var prefetched: null
+  property bool prefetchWanted: false
 
   readonly property var sources: status && status.sources ? status.sources : []
   readonly property var favInfo: status && status.favorites ? status.favorites : ({ count: 0, selected: false })
@@ -45,7 +47,7 @@ Panel {
   readonly property bool timerEnabled: !!(userSettings.timer && userSettings.timer.enabled)
   readonly property int timerMinutes: Model.clampMinutes(userSettings.timer ? userSettings.timer.minutes : 60)
   readonly property bool busy: actionProc.running
-  readonly property bool browseLoading: browseBusy
+  readonly property var syncInfo: Model.syncView(status && status.sync ? status.sync : null, browseSource, status)
 
   implicitWidth: barButton.implicitWidth
   implicitHeight: barButton.implicitHeight
@@ -65,13 +67,48 @@ Panel {
   function loadBrowse(key, page) {
     if (browseBusy) return
     browseBusy = true
-    if (page === 1) { browseItems = []; browsePage = 0; browseLastPage = 0; browseTotal = 0 }
+    if (page === 1) { browseModel.clear(); browsePage = 0; browseLastPage = 0; browseTotal = 0; prefetched = null }
     browseSource = key
     browseError = ""
     browseProc.start([root.commandPath, "browse", key, "--page", String(page)])
   }
+  function acceptPage(result) {
+    if (result.source !== browseSource) return
+    // Append only the new cards; replacing the whole model would rebuild every card.
+    if (result.page === 1) browseModel.clear()
+    var items = Array.isArray(result.items) ? result.items : []
+    for (var i = 0; i < items.length; i++) browseModel.append(Model.browseRow(items[i]))
+    browsePage = result.page
+    browseLastPage = result.lastPage
+    browseTotal = result.total
+    Qt.callLater(function() { if (root.wantsMore()) root.loadMore(); else root.startPrefetch() })
+  }
+  // Load ahead while 1.5 screens of cards remain, so scrolling never reaches the end and stops.
+  function wantsMore() {
+    return Model.nearEnd(grid.contentY, grid.height, grid.originY, grid.contentHeight, 1.5)
+  }
   function loadMore() {
-    if (!browseBusy && browsePage > 0 && browsePage < browseLastPage) loadBrowse(browseSource, browsePage + 1)
+    if (browseBusy || browsePage <= 0 || browsePage >= browseLastPage) return
+    var next = browsePage + 1
+    if (prefetched && prefetched.source === browseSource && prefetched.page === next) {
+      var ready = prefetched
+      prefetched = null
+      acceptPage(ready)
+      return
+    }
+    if (prefetchProc.running && prefetchProc.source === browseSource && prefetchProc.page === next) {
+      browseBusy = true
+      prefetchWanted = true
+      return
+    }
+    loadBrowse(browseSource, next)
+  }
+  function startPrefetch() {
+    var next = browsePage + 1
+    if (!browseOpen || browsePage <= 0 || next > browseLastPage || prefetchProc.running) return
+    if (prefetched && prefetched.source === browseSource && prefetched.page === next) return
+    prefetched = null
+    prefetchProc.start(browseSource, next)
   }
   function openBrowse() {
     root.close()
@@ -83,6 +120,12 @@ Panel {
   function applyFromBrowse(id) {
     closeBrowse()
     runAction(["apply", id])
+  }
+  // Sync outlives the panel and the browse view; progress comes back through sync.json.
+  function syncAction() {
+    if (!syncInfo) return
+    if (syncInfo.action === "cancel") runAction(["sync", "--cancel"])
+    else if (syncInfo.action === "start") Quickshell.execDetached([root.commandPath, "sync", browseSource])
   }
 
   onOpenedChanged: if (opened) refreshStatus()
@@ -96,7 +139,7 @@ Panel {
       try { root.pluginVersion = String(JSON.parse(text()).version || "") } catch (e) { root.pluginVersion = "" }
     }
   }
-  // The timer service and keybinding change state outside this widget.
+  // The timer service, keybinding and background sync change state outside this widget.
   FileView {
     path: root.stateHome + "/omawall/status.json"
     watchChanges: true
@@ -105,6 +148,12 @@ Panel {
   }
   FileView {
     path: root.stateHome + "/omawall/settings.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: statusDebounce.restart()
+  }
+  FileView {
+    path: root.stateHome + "/omawall/sync.json"
     watchChanges: true
     printErrors: false
     onFileChanged: statusDebounce.restart()
@@ -170,18 +219,48 @@ Panel {
       root.browseBusy = false
       var result = Model.parseResult(browseOut.text)
       if (!result.ok) { root.browseError = result.error.message; return }
-      if (result.source !== root.browseSource) return
-      var items = Array.isArray(result.items) ? result.items : []
-      root.browseItems = result.page === 1 ? items : root.browseItems.concat(items)
-      root.browsePage = result.page
-      root.browseLastPage = result.lastPage
-      root.browseTotal = result.total
-      // A page that fits on screen leaves nothing to scroll; fetch the next one.
-      Qt.callLater(function() { if (grid.atYEnd) root.loadMore() })
+      root.acceptPage(result)
     }
     onRunningChanged: {
       if (!running) Qt.callLater(function() {
-        if (!browseProc.exitSeen && !browseProc.running) { browseProc.exitSeen = true; root.browseBusy = false; root.browseError = "無法執行 omawall CLI。" }
+        if (!browseProc.exitSeen && !browseProc.running) { browseProc.exitSeen = true; root.browseBusy = false; root.browseError = "Could not run the omawall CLI." }
+      })
+    }
+  }
+
+  Process {
+    id: prefetchProc
+    property string source: ""
+    property int page: 0
+    property bool exitSeen: true
+    function start(key, n) {
+      exitSeen = false
+      source = key
+      page = n
+      command = [root.commandPath, "browse", key, "--page", String(n)]
+      running = true
+    }
+    stdout: StdioCollector { id: prefetchOut; waitForEnd: true }
+    onExited: function(code) {
+      exitSeen = true
+      var result = Model.parseResult(prefetchOut.text)
+      var wanted = root.prefetchWanted
+      root.prefetchWanted = false
+      if (wanted) {
+        // The user scrolled here while it loaded: show it now.
+        root.browseBusy = false
+        if (result.ok) root.acceptPage(result)
+        else root.browseError = result.error.message
+        return
+      }
+      if (result.ok && result.source === root.browseSource && result.page === root.browsePage + 1) root.prefetched = result
+    }
+    onRunningChanged: {
+      if (!running) Qt.callLater(function() {
+        if (!prefetchProc.exitSeen && !prefetchProc.running) {
+          prefetchProc.exitSeen = true
+          if (root.prefetchWanted) { root.prefetchWanted = false; root.browseBusy = false; root.browseError = "Could not run the omawall CLI." }
+        }
       })
     }
   }
@@ -192,10 +271,10 @@ Panel {
     bar: root.bar
     text: Model.Icons.wallpaper
     active: root.bannerInfo !== null && root.bannerInfo.tone === "error"
-    Accessible.name: "omawall 桌布"
-    tooltipText: root.current
-      ? "omawall · " + Model.sourceLabel(root.status, root.current.source) + " · " + root.current.id + "\n左鍵：下一張　右鍵：設定"
-      : "omawall\n左鍵：下一張　右鍵：設定"
+    Accessible.name: "omawall wallpaper"
+    tooltipText: (root.current
+      ? "omawall · " + Model.sourceLabel(root.status, root.current.source) + " · " + root.current.id
+      : "omawall") + "\nLeft click: next wallpaper · Right click: settings"
     onPressed: function(button) {
       if (button === Qt.LeftButton) root.runAction(["next"])
       else root.toggle()
@@ -239,7 +318,7 @@ Panel {
             }
             ActionButton {
               visible: root.hasLastError && root.cliState === "ok"
-              text: "重試"
+              text: "Retry"
               onClicked: root.runAction(["next"])
             }
           }
@@ -260,7 +339,7 @@ Panel {
               Label {
                 text: root.current
                   ? Model.sourceLabel(root.status, root.current.source) + " · " + root.current.id
-                  : "尚未套用 Wallhaven 桌布"
+                  : "No Wallhaven wallpaper yet"
                 font.bold: true
                 font.pixelSize: Style.font.title
                 Layout.fillWidth: true
@@ -273,7 +352,7 @@ Panel {
               }
               Label {
                 visible: root.current !== null
-                text: root.current ? "收藏數 " + Model.formatCount(root.current.favorites) : ""
+                text: root.current ? Model.formatCount(root.current.favorites) + " favorites on Wallhaven" : ""
                 color: root.dim
                 Layout.fillWidth: true
               }
@@ -282,29 +361,24 @@ Panel {
 
           GridLayout {
             Layout.fillWidth: true
-            columns: 5
+            columns: 4
             columnSpacing: Style.spacing.md
             ActionButton {
-              text: "下一張"
+              text: "Next"
               selected: true
               enabled: !root.busy
               iconSpinning: root.busy
               onClicked: root.runAction(["next"])
             }
-            ActionButton { text: "瀏覽"; onClicked: root.openBrowse() }
+            ActionButton { text: "Browse"; onClicked: root.openBrowse() }
             ActionButton {
-              text: "不喜歡"
-              enabled: !root.busy && root.current !== null
-              onClicked: root.runAction(["dislike"])
-            }
-            ActionButton {
-              text: root.currentIsFav ? "已收藏" : "收藏"
+              text: root.currentIsFav ? "Favorited" : "Favorite"
               selected: root.currentIsFav
               enabled: !root.busy && root.current !== null
               onClicked: root.runAction(["fav"])
             }
             ActionButton {
-              text: "原頁"
+              text: "Open page"
               enabled: root.current !== null && Model.wallpaperUrl(root.current.id) !== ""
               onClicked: root.openUrl(Model.wallpaperUrl(root.current.id))
             }
@@ -312,20 +386,20 @@ Panel {
 
           RowLayout {
             Layout.fillWidth: true
-            Label { text: "來源"; font.bold: true }
+            Label { text: "Sources"; font.bold: true }
             Label {
-              text: "已選 " + Model.selectedSources(root.status).length + "／" + (root.sources.length + 1)
-                + (Model.poolSize(root.status) !== null ? " · 約 " + Model.formatCount(Model.poolSize(root.status)) + " 張" : "")
+              text: Model.selectedSources(root.status).length + " of " + (root.sources.length + 1) + " selected"
+                + (Model.poolSize(root.status) !== null ? " · about " + Model.formatCount(Model.poolSize(root.status)) + " wallpapers" : "")
               color: root.dim
               Layout.fillWidth: true
             }
-            LinkButton { text: "全選"; onClicked: root.setSetting("sources", Model.allSources(root.status)) }
-            LinkButton { text: "清除"; onClicked: root.setSetting("sources", "") }
+            LinkButton { text: "All"; onClicked: root.setSetting("sources", Model.allSources(root.status)) }
+            LinkButton { text: "None"; onClicked: root.setSetting("sources", "") }
           }
           ActionButton {
             Layout.fillWidth: true
             leftAlign: true
-            text: "收藏 · " + Model.formatCount(root.favInfo.count) + " 張 · 本機，不套用篩選"
+            text: "Favorites · " + Model.formatCount(root.favInfo.count) + " · local, filters don't apply"
             selected: root.favInfo.selected === true
             enabled: !root.busy
             onClicked: root.setSetting("sources", Model.toggledSources(root.status, "favs"))
@@ -348,7 +422,7 @@ Panel {
             }
           }
 
-          Label { text: "畫風"; font.bold: true }
+          Label { text: "Style"; font.bold: true }
           RowLayout {
             Layout.fillWidth: true
             spacing: Style.spacing.md
@@ -366,18 +440,18 @@ Panel {
             }
           }
 
-          Label { text: "篩色"; font.bold: true }
+          Label { text: "Color"; font.bold: true }
           RowLayout {
             Layout.fillWidth: true
             spacing: Style.spacing.md
             ActionButton {
-              text: "不篩"
+              text: "Any"
               selected: root.userSettings.color !== "theme"
               enabled: !root.busy
               onClicked: root.setSetting("color", "none")
             }
             ActionButton {
-              text: "跟隨主題 accent"
+              text: "Theme accent"
               selected: root.userSettings.color === "theme"
               enabled: !root.busy
               onClicked: root.setSetting("color", "theme")
@@ -386,17 +460,17 @@ Panel {
 
           RowLayout {
             Layout.fillWidth: true
-            Label { text: "定時換圖"; font.bold: true }
+            Label { text: "Timer"; font.bold: true }
             Label { text: Model.timerText(root.userSettings); color: root.dim; Layout.fillWidth: true }
             ToggleSwitch {
               checked: root.timerEnabled
               enabled: !root.busy
-              Accessible.name: "定時換圖開關"
+              Accessible.name: "Change wallpaper on a timer"
               onToggled: root.setSetting("timer.enabled", !root.timerEnabled)
             }
           }
           NumberField {
-            label: "每幾分鐘換一張（5–1440）"
+            label: "Minutes between wallpapers (5–1440)"
             from: Model.MIN_MINUTES
             to: Model.MAX_MINUTES
             value: root.timerMinutes
@@ -414,143 +488,192 @@ Panel {
     shown: root.browseOpen
     WlrLayershell.namespace: "omawall-browse"
 
+    // Dimmed backdrop; a click outside the panel closes it.
     Rectangle {
       anchors.fill: parent
-      color: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 0.94)
+      color: Qt.rgba(0, 0, 0, 0.35)
+      MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
+        onClicked: root.closeBrowse()
+      }
     }
 
-    FocusScope {
-      id: browseScope
-      anchors.fill: parent
-      focus: true
-      Keys.onEscapePressed: root.closeBrowse()
+    Rectangle {
+      id: browsePanel
+      anchors.centerIn: parent
+      width: Math.round(parent.width * 0.8)
+      height: Math.round(parent.height * 0.85)
+      color: Color.popups.background
+      border.color: Color.popups.border
+      border.width: Math.max(1, Style.space(2))
+      radius: Style.cornerRadius
 
-      ColumnLayout {
+      // Clicks inside the panel must not reach the backdrop.
+      MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons }
+
+      FocusScope {
+        id: browseScope
         anchors.fill: parent
-        anchors.margins: Style.space(48)
-        spacing: Style.spacing.huge
+        focus: true
+        Keys.onEscapePressed: root.closeBrowse()
 
-        RowLayout {
-          Layout.fillWidth: true
-          ColumnLayout {
+        ColumnLayout {
+          id: browseColumn
+          anchors.fill: parent
+          anchors.margins: Style.space(32)
+          spacing: Style.spacing.huge
+
+          RowLayout {
             Layout.fillWidth: true
-            spacing: Style.spacing.xs
-            Label { text: "瀏覽桌布"; color: Color.foreground; font.bold: true; font.pixelSize: Style.font.heading }
-            Label {
-              text: "SFW · 4K 以上 · 16:9 · 依收藏數排序 · 畫風 " + Model.stylesText(root.userSettings) + " · " + Model.colorText(root.userSettings)
-              color: Qt.darker(Color.foreground, 1.45)
+            ColumnLayout {
+              Layout.fillWidth: true
+              spacing: Style.spacing.xs
+              // Labels fill the column so it can grow and push Close to the right edge.
+              Label { text: "Browse wallpapers"; color: Color.foreground; font.bold: true; font.pixelSize: Style.font.heading; Layout.fillWidth: true }
+              Label {
+                text: "SFW · 4K or larger · 16:9 · most favorited first · " + Model.stylesText(root.userSettings) + " · " + Model.colorText(root.userSettings)
+                color: Qt.darker(Color.foreground, 1.45)
+                Layout.fillWidth: true
+              }
+            }
+            ActionButton { text: "Close"; Layout.fillWidth: false; onClicked: root.closeBrowse() }
+          }
+
+          Flow {
+            Layout.fillWidth: true
+            spacing: Style.spacing.md
+            Repeater {
+              model: Model.browseTabs(root.status)
+              delegate: ActionButton {
+                required property var modelData
+                text: (modelData.selected ? "• " : "") + modelData.label + "  " + Model.formatCount(modelData.count)
+                selected: root.browseSource === modelData.key
+                onClicked: root.loadBrowse(modelData.key, 1)
+              }
             }
           }
-          ActionButton { text: "關閉"; Layout.fillWidth: false; onClicked: root.closeBrowse() }
-        }
 
-        Flow {
-          Layout.fillWidth: true
-          spacing: Style.spacing.md
-          Repeater {
-            model: Model.browseTabs(root.status)
-            delegate: ActionButton {
-              required property var modelData
-              text: (modelData.selected ? "• " : "") + modelData.label + "  " + Model.formatCount(modelData.count)
-              selected: root.browseSource === modelData.key
-              onClicked: root.loadBrowse(modelData.key, 1)
-            }
+          Label {
+            visible: root.browseError !== ""
+            text: root.browseError
+            color: Color.urgent
           }
-        }
+          Label {
+            visible: root.browseError === "" && browseModel.count === 0
+            text: root.browseBusy ? "Loading…"
+              : (root.browseSource === "favs" ? "No favorites yet. Press Favorite in the panel to add the current wallpaper." : "No wallpapers match these filters.")
+            color: Qt.darker(Color.foreground, 1.45)
+          }
 
-        Label {
-          visible: root.browseError !== ""
-          text: root.browseError
-          color: Color.urgent
-        }
-        Label {
-          visible: root.browseError === "" && root.browseItems.length === 0
-          text: root.browseLoading ? "載入中…"
-            : (root.browseSource === "favs" ? "還沒有收藏。在 widget 按「收藏」，就會出現在這裡。" : "沒有符合條件的桌布。")
-          color: Qt.darker(Color.foreground, 1.45)
-        }
+          GridView {
+            id: grid
+            // Whole columns only, centered in the panel.
+            Layout.preferredWidth: Math.max(cellWidth, Math.floor(browseColumn.width / cellWidth) * cellWidth)
+            Layout.alignment: Qt.AlignHCenter
+            Layout.fillHeight: true
+            clip: true
+            reuseItems: true
+            cellWidth: 432 + Style.space(16)
+            cellHeight: 243 + Style.space(40)
+            model: ListModel { id: browseModel }
+            boundsBehavior: Flickable.StopAtBounds
+            QQC.ScrollBar.vertical: QQC.ScrollBar {}
+            onContentYChanged: if (root.wantsMore()) root.loadMore()
 
-        GridView {
-          id: grid
-          Layout.fillWidth: true
-          Layout.fillHeight: true
-          clip: true
-          reuseItems: true
-          cellWidth: 432 + Style.space(16)
-          cellHeight: 243 + Style.space(40)
-          model: root.browseItems
-          boundsBehavior: Flickable.StopAtBounds
-          QQC.ScrollBar.vertical: QQC.ScrollBar {}
-          onAtYEndChanged: if (atYEnd) root.loadMore()
+            delegate: Item {
+              id: card
+              required property string wid
+              required property string thumb
+              required property string resolution
+              required property real favs
+              required property real size
+              required property bool seen
+              required property bool fav
+              required property bool current
+              width: grid.cellWidth
+              height: grid.cellHeight
 
-          delegate: Item {
-            id: card
-            required property var modelData
-            width: grid.cellWidth
-            height: grid.cellHeight
-
-            Rectangle {
-              id: frame
-              width: 432
-              height: 243 + Style.space(28)
-              color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.05)
-              border.width: card.modelData.current || mouse.containsMouse ? 2 : 0
-              border.color: card.modelData.current ? Color.accent : Qt.darker(Color.foreground, 1.6)
-
-              SizedImage {
-                x: 0
-                y: 0
+              Rectangle {
+                id: frame
                 width: 432
-                height: 243
-                url: Model.fileUrl(card.modelData.thumb)
-                crop: true
-                opacity: card.modelData.disliked ? 0.35 : 1
+                height: 243 + Style.space(28)
+                color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.05)
+                border.width: card.current || mouse.containsMouse ? 2 : 0
+                border.color: card.current ? Color.accent : Qt.darker(Color.foreground, 1.6)
+
+                SizedImage {
+                  x: 0
+                  y: 0
+                  width: 432
+                  height: 243
+                  url: Model.fileUrl(card.thumb)
+                  crop: true
+                }
+                Label {
+                  anchors.left: parent.left
+                  anchors.bottom: parent.bottom
+                  anchors.margins: Style.space(6)
+                  text: Model.formatResolution(card.resolution) + " · " + Model.formatSize(card.size)
+                  color: Qt.darker(Color.foreground, 1.3)
+                  font.pixelSize: Style.font.bodySmall
+                  wrapMode: Text.NoWrap
+                }
+                Label {
+                  anchors.right: parent.right
+                  anchors.bottom: parent.bottom
+                  anchors.margins: Style.space(6)
+                  text: Model.formatCount(card.favs) + " favorites"
+                  color: Qt.darker(Color.foreground, 1.3)
+                  font.pixelSize: Style.font.bodySmall
+                  wrapMode: Text.NoWrap
+                }
+                Row {
+                  x: Style.space(8)
+                  y: Style.space(8)
+                  spacing: Style.space(6)
+                  Badge { visible: card.current; text: "Current"; strong: true }
+                  Badge { visible: card.seen && !card.current; text: "Seen" }
+                  Badge { visible: card.fav; text: "Favorite" }
+                }
+                MouseArea {
+                  id: mouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.applyFromBrowse(card.wid)
+                }
+                Accessible.role: Accessible.Button
+                Accessible.name: "Apply " + card.wid
               }
-              Label {
-                anchors.left: parent.left
-                anchors.bottom: parent.bottom
-                anchors.margins: Style.space(6)
-                text: Model.formatResolution(card.modelData.resolution) + " · " + Model.formatSize(card.modelData.fileSize)
-                color: Qt.darker(Color.foreground, 1.3)
-                font.pixelSize: Style.font.bodySmall
-                wrapMode: Text.NoWrap
-              }
-              Label {
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                anchors.margins: Style.space(6)
-                text: "收藏 " + Model.formatCount(card.modelData.favorites)
-                color: Qt.darker(Color.foreground, 1.3)
-                font.pixelSize: Style.font.bodySmall
-                wrapMode: Text.NoWrap
-              }
-              Row {
-                x: Style.space(8)
-                y: Style.space(8)
-                spacing: Style.space(6)
-                Badge { visible: card.modelData.current === true; text: "使用中"; strong: true }
-                Badge { visible: card.modelData.seen === true && card.modelData.current !== true; text: "看過" }
-                Badge { visible: card.modelData.favorite === true; text: "已收藏" }
-                Badge { visible: card.modelData.disliked === true; text: "已排除" }
-              }
-              MouseArea {
-                id: mouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.applyFromBrowse(card.modelData.id)
-              }
-              Accessible.role: Accessible.Button
-              Accessible.name: "套用 " + card.modelData.id
             }
           }
-        }
 
-        Label {
-          visible: root.browsePage > 0
-          text: "第 " + root.browsePage + "／" + root.browseLastPage + " 頁 · 已載入 " + Model.formatCount(root.browseItems.length)
-            + "／" + Model.formatCount(root.browseTotal) + " 張" + (root.browseLoading ? " · 載入中…" : "")
-          color: Qt.darker(Color.foreground, 1.45)
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.spacing.md
+            Label {
+              visible: root.browsePage > 0
+              text: "Page " + root.browsePage + " of " + root.browseLastPage + " · " + Model.formatCount(browseModel.count)
+                + " of " + Model.formatCount(root.browseTotal) + " loaded" + (root.browseBusy ? " · loading…" : "")
+              color: Qt.darker(Color.foreground, 1.45)
+              wrapMode: Text.NoWrap
+            }
+            Button {
+              visible: root.syncInfo !== null && root.browsePage > 0
+              iconText: root.syncInfo ? root.syncInfo.icon : ""
+              iconSpinning: root.syncInfo !== null && root.syncInfo.spinning
+              text: root.syncInfo ? root.syncInfo.text : ""
+              tooltipText: root.syncInfo ? root.syncInfo.tooltip : ""
+              foreground: root.syncInfo && root.syncInfo.tone === "error" ? Color.urgent : Qt.darker(Color.foreground, 1.45)
+              fontSize: Style.font.bodySmall
+              enabled: root.cliState === "ok" && !(root.syncInfo && root.syncInfo.action === "cancel" && root.busy)
+              Accessible.role: Accessible.Button
+              Accessible.name: tooltipText
+              onClicked: root.syncAction()
+            }
+            Item { Layout.fillWidth: true }
+          }
         }
       }
     }
