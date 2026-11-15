@@ -98,6 +98,10 @@ test('banner prefers install problems, then version mismatch, then last error', 
   assert.equal(M.banner('ok', status, '0.1.0'), null);
   const limited = { ...status, status: { lastError: { code: 'rate_limited', message: 'Rate limited' } } };
   assert.deepEqual({ ...M.banner('ok', limited, '0.1.0') }, { tone: 'warn', text: 'Rate limited' });
+  const down = { ...status, status: { lastError: { code: 'unavailable', message: 'Down' } } };
+  assert.equal(M.banner('ok', down, '0.1.0').tone, 'warn');
+  const broken = { ...status, status: { lastError: { code: 'set_failed', message: 'x' } } };
+  assert.equal(M.banner('ok', broken, '0.1.0').tone, 'error');
 });
 
 test('markup-shaped CLI text passes through as plain data', () => {
@@ -113,9 +117,9 @@ test('sync control: progress while running, a check when done, resume otherwise'
   assert.deepEqual([idle.icon, idle.text, idle.tooltip, idle.action], [M.Icons.sync, '', 'Sync all Landscape thumbnails', 'start']);
   const running = { source: 'landscape', state: 'running', done: 1234, total: 4071, skipped: 0, updatedAt: 1794700000 };
   const here = M.syncView(running, running, 'landscape', status);
-  assert.deepEqual([here.text, here.action, here.spinning, here.tooltip], ['1,234 / 4,071', 'cancel', true, 'Cancel sync']);
-  assert.equal(M.syncView(running, null, 'city', status).text, 'Landscape 1,234 / 4,071');
-  assert.equal(M.syncView({ ...running, total: null, done: 0 }, null, 'landscape', status).text, '0 / …');
+  assert.deepEqual([here.text, here.action, here.spinning, here.tooltip], ['Syncing 1,234 / 4,071', 'cancel', true, 'Cancel sync']);
+  assert.equal(M.syncView(running, null, 'city', status).text, 'Syncing Landscape 1,234 / 4,071');
+  assert.equal(M.syncView({ ...running, total: null, done: 0 }, null, 'landscape', status).text, 'Syncing 0 / …');
   // Finished: a check, no action, and the date it finished.
   const done = M.syncView(null, { ...running, state: 'done' }, 'landscape', status);
   assert.deepEqual([done.icon, done.text, done.action], [M.Icons.synced, '', '']);

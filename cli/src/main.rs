@@ -4,6 +4,7 @@ mod color;
 mod config;
 mod error;
 mod image;
+mod pages;
 mod paths;
 mod select;
 mod state;

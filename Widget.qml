@@ -33,6 +33,9 @@ Panel {
   property int browseTotal: 0
   property int browseLoaded: 0
   property string browseError: ""
+  // Set when a page came from disk because Wallhaven was down, or a later page failed to load.
+  property bool browseOffline: false
+  property string browsePageError: ""
   // Pages of the current source already in the grid, by page number.
   property var loadedPages: ({})
   // The card the keyboard acts on.
@@ -79,6 +82,8 @@ Panel {
     browseTotal = 0
     browseLoaded = 0
     browseError = ""
+    browseOffline = false
+    browsePageError = ""
     loadedPages = ({})
     selectedIndex = 0
     pumpBrowse()
@@ -110,10 +115,9 @@ Panel {
     // Wallhaven's total drifts a little; the last page settles the real length.
     var end = start + items.length
     if (result.page >= browseLastPage && browseModel.count > end) browseModel.remove(end, browseModel.count - end)
-    var pages = loadedPages
-    pages[result.page] = true
-    loadedPages = pages
+    markLoaded(result.page)
     browseLoaded += items.length
+    if (result.cached === true) browseOffline = true
   }
   function openBrowse() {
     root.close()
@@ -122,6 +126,11 @@ Panel {
     Qt.callLater(function() { browseScope.forceActiveFocus() })
   }
   function closeBrowse() { browseOpen = false }
+  function markLoaded(page) {
+    var pages = loadedPages
+    pages[page] = true
+    loadedPages = pages
+  }
   function gridColumns() { return Math.max(1, Math.floor(grid.width / grid.cellWidth)) }
   function selectMove(move) {
     var rows = Math.max(1, Math.floor(grid.height / grid.cellHeight))
@@ -281,11 +290,13 @@ Panel {
   Process {
     id: browseProc
     property string source: ""
+    property int page: 0
     property bool exitSeen: true
-    function start(key, page) {
+    function start(key, n) {
       exitSeen = false
       source = key
-      command = [root.commandPath, "browse", key, "--page", String(page)]
+      page = n
+      command = [root.commandPath, "browse", key, "--page", String(n)]
       running = true
     }
     stdout: StdioCollector { id: browseOut; waitForEnd: true }
@@ -294,8 +305,13 @@ Panel {
       // A reply for a source the user has left is dropped.
       if (source === root.browseSource) {
         var result = Model.parseResult(browseOut.text)
-        if (!result.ok) root.browseError = result.error.message
-        else if (result.source === root.browseSource) root.acceptPage(result)
+        if (result.ok && result.source === root.browseSource) root.acceptPage(result)
+        else if (!result.ok && root.browseLastPage === 0) root.browseError = result.error.message
+        else if (!result.ok) {
+          // Later pages that fail stay blank; the rest of the source keeps loading.
+          root.markLoaded(page)
+          root.browsePageError = result.error.message
+        }
       }
       Qt.callLater(root.pumpBrowse)
     }
@@ -780,6 +796,16 @@ Panel {
               Accessible.role: Accessible.Button
               Accessible.name: tooltipText
               onClicked: Util.execArgv(["xdg-open", root.thumbsDir])
+            }
+            Label {
+              visible: root.browsePageError !== "" || root.browseOffline
+              text: root.browsePageError !== "" ? "Some pages could not load: " + root.browsePageError
+                : "Wallhaven unreachable · showing saved pages"
+              color: root.browsePageError !== "" ? Color.urgent : Color.accent
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.NoWrap
+              elide: Text.ElideRight
+              Layout.maximumWidth: Style.space(560)
             }
             Item { Layout.fillWidth: true }
             Label {

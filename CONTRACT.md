@@ -13,6 +13,7 @@ the commands, files and JSON shapes below. Change this file first when the inter
 | Cache dir | `$XDG_CACHE_HOME/omawall/` (default `~/.cache/omawall/`) |
 | Full images | `<cache>/full/wallhaven-<id>.<jpg|png>` |
 | Thumbnails | `<cache>/thumbs/<id>.jpg` (or `.png`, by detected type) |
+| Saved pages | `<cache>/pages/<query key, non-alphanumerics as _>/<page>.json` |
 | Favorites | `~/Pictures/Wallpapers/wallhaven/wallhaven-<id>.<jpg|png>` |
 
 Wallhaven ids match `^[a-z0-9]{1,16}$`; anything else is rejected.
@@ -90,13 +91,18 @@ An invalid config is an error (`config`), never silently replaced.
 - Rate limit is 45 API requests per minute. `sync` spaces its API requests at least 2 s apart so
   `next` and `browse` keep headroom. Thumbnail downloads are not API requests.
 - `browse` downloads a page's thumbnails up to 6 at a time; `sync` downloads them one by one.
+- HTTP 5xx (Wallhaven or Cloudflare in front of it is down) is `unavailable`, not `http`.
+- Saved pages: every search page fetched by `next`, `browse` or `sync` is saved. `next`, `browse` and the
+  metadata lookup of `apply` retry once after 2 s on `network`, `timeout`, `unavailable` or `rate_limited`;
+  if it still fails that way, they use the saved page (`apply`: the saved entry with that id from any page)
+  and fail only when there is none. The full image itself still comes from `w.wallhaven.cc`.
 
 ## Commands
 
 Every command prints exactly one JSON object on stdout (except `--version`). Success: `{"ok": true, ...}`, exit 0.
 Failure: `{"ok": false, "error": {"code": "...", "message": "English message"}}`, exit 1 (usage errors exit 2).
 
-Error codes: `usage`, `config`, `network`, `timeout`, `rate_limited` (HTTP 429), `http`, `invalid_response`,
+Error codes: `usage`, `config`, `network`, `timeout`, `rate_limited` (HTTP 429), `unavailable` (HTTP 5xx), `http`, `invalid_response`,
 `invalid_image`, `too_large`, `no_candidates`, `busy`, `not_found`, `io`, `set_failed`.
 
 | Command | Network | Result |
@@ -106,7 +112,7 @@ Error codes: `usage`, `config`, `network`, `timeout`, `rate_limited` (HTTP 429),
 | `omawall next [--trigger manual\|timer]` | yes | applies the next wallpaper; `{ok, current}` |
 | `omawall apply <id> [--trigger manual]` | yes | downloads and applies that id; `{ok, current}` |
 | `omawall fav` | no* | toggles favorite for current; `{ok, favorite: bool, current}` |
-| `omawall browse <sourceKey\|favs> [--page N]` | yes | `{ok, source, page, lastPage, total, items: [{id, thumb, resolution, favorites, fileSize, seen, favorite, current}]}`, 24 per page, thumbnails downloaded first |
+| `omawall browse <sourceKey\|favs> [--page N]` | yes | `{ok, source, page, lastPage, total, items: [{id, thumb, resolution, favorites, fileSize, seen, favorite, current}], cached}`, 24 per page, thumbnails downloaded first; `cached` is true when the page came from disk; a thumbnail that cannot be fetched is `null` (only `io` fails the page) |
 | `omawall set <name> <value>` | no | `{ok, settings}`; names: `sources` (comma list, may be empty, may include `favs`), `style.general`, `style.anime` (`true`/`false`), `color` (`none`/`theme`), `timer.enabled` (`true`/`false`), `timer.minutes` (integer 5–1440) |
 
 | `omawall sync <sourceKey>` | yes | long-running: downloads every thumbnail of that tag source for the current filters; progress in `syncs.json`; prints `{ok, sync}` when it ends as `done` or `canceled`, the failure envelope when `failed` |
@@ -147,7 +153,7 @@ The plugin starts it detached (`Quickshell.execDetached`), so it outlives the pa
    `page` is the page being walked (1 before the first page arrives); `pageDone`/`pageSkipped` are the counts
    before it. `total` and `lastPage` are `null` until the first page arrives. `error` is `{code, message}` or
    `null`. At the end the thumbnail cache is trimmed like `browse`. `sync.json` from 0.2.0 is not read.
-7. `sync` never notifies and never touches `status.json`, `seen.json` or `favorites.json`.
+7. `sync` saves every page it walks, never notifies and never touches `status.json`, `seen.json` or `favorites.json`.
 
 `status.sources[].sync` is that source's record for the current filters, or `null`. `status.sync` is the record
 being synced right now, or `null`. A `running` record while `<state>/sync.lock` is free (the process died) is

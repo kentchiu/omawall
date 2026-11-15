@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "kent.omawall",
   "name": "omawall",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "author": "Kent Chiu",
   "description": "Wallhaven wallpapers for Omarchy: multi-source rotation, favorites, browsing and a timer.",
   "kinds": [

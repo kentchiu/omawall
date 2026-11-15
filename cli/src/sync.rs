@@ -17,6 +17,7 @@ use crate::cache;
 use crate::config::{self, Settings};
 use crate::error::{AppError, Result};
 use crate::image;
+use crate::pages;
 use crate::paths::Paths;
 use crate::state;
 use crate::wallhaven::{self, Query, SearchPage};
@@ -215,6 +216,8 @@ impl Run<'_> {
             self.state.page_done = self.state.done;
             self.state.page_skipped = self.state.skipped;
             let result = self.search(query, page)?;
+            // Synced sources stay browsable while Wallhaven is down.
+            let _ = pages::save(&self.app.paths.pages_dir(), &query.key(), page, &result);
             self.state.total = Some(result.total);
             self.state.last_page = Some(result.last_page);
             for item in &result.items {

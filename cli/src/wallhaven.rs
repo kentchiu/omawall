@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, Result};
 
@@ -80,7 +80,21 @@ fn too_large() -> AppError {
 }
 
 fn http_error(status: u16) -> AppError {
+    if status >= 500 {
+        return AppError::new(
+            "unavailable",
+            format!("Wallhaven is having trouble right now (HTTP {status}); try again later"),
+        );
+    }
     AppError::new("http", format!("Wallhaven returned HTTP {status}"))
+}
+
+/// Failures worth one retry and a fall back to saved pages: Wallhaven is slow, down or busy.
+pub fn is_transient(e: &AppError) -> bool {
+    matches!(
+        e.code,
+        "network" | "timeout" | "unavailable" | "rate_limited"
+    )
 }
 
 pub fn invalid_response(why: &str) -> AppError {
@@ -165,7 +179,7 @@ impl Query {
 }
 
 /// A validated wallpaper entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
     pub id: String,
     pub full_url: String,
@@ -175,7 +189,7 @@ pub struct Item {
     pub file_size: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchPage {
     pub last_page: u64,
     pub total: u64,
@@ -372,6 +386,8 @@ pub mod tests {
         t.add("https://wallhaven.cc/slow", 429, vec![]);
         t.add("https://wallhaven.cc/gone", 404, vec![]);
         t.add("https://wallhaven.cc/redirect", 302, vec![]);
+        t.add("https://wallhaven.cc/down", 502, vec![]);
+        t.add("https://wallhaven.cc/tls", 525, vec![]);
         let get = |u: &str| fetch(&t, u, API_TIMEOUT, API_LIMIT).unwrap_err().code;
         assert_eq!(get("https://wallhaven.cc/big"), "too_large");
         assert_eq!(get("https://wallhaven.cc/slow"), "rate_limited");
@@ -383,6 +399,15 @@ pub mod tests {
         assert_eq!(get("https://example.com/x"), "invalid_response");
         // Disallowed URLs never reach the transport.
         assert_eq!(t.calls().len(), 4);
+        // Cloudflare's 5xx pages mean Wallhaven is down, not that the request was wrong.
+        assert_eq!(get("https://wallhaven.cc/down"), "unavailable");
+        assert_eq!(get("https://wallhaven.cc/tls"), "unavailable");
+        assert!(is_transient(
+            &fetch(&t, "https://wallhaven.cc/down", API_TIMEOUT, API_LIMIT).unwrap_err()
+        ));
+        assert!(!is_transient(
+            &fetch(&t, "https://wallhaven.cc/gone", API_TIMEOUT, API_LIMIT).unwrap_err()
+        ));
     }
 
     #[test]

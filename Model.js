@@ -184,7 +184,9 @@ function banner(cliState, status, pluginVersion) {
     return { tone: "error", text: "CLI " + status.version + " does not match plugin " + pluginVersion + ". Run scripts/install-cli again." }
   var err = status && status.status ? status.status.lastError : null
   if (!err || typeof err.message !== "string") return null
-  return { tone: err.code === "rate_limited" ? "warn" : "error", text: err.message }
+  // Wallhaven being slow, busy or down is a warning, not something to fix here.
+  var outage = ["rate_limited", "unavailable", "timeout", "network"].indexOf(err.code) !== -1
+  return { tone: outage ? "warn" : "error", text: err.message }
 }
 
 // Local date of a Unix time in seconds, as YYYY-MM-DD.
@@ -213,7 +215,7 @@ function syncView(running, record, key, status) {
   var view = { icon: Icons.sync, text: "", tooltip: "Sync all " + label(key) + " thumbnails", action: "start", tone: "normal", spinning: false }
   if (running) {
     var here = running.source === key
-    view.text = here ? progress(running) : label(running.source) + " " + progress(running)
+    view.text = "Syncing " + (here ? "" : label(running.source) + " ") + progress(running)
     view.tooltip = here ? "Cancel sync" : "Cancel " + label(running.source) + " sync"
     view.action = "cancel"
     view.spinning = true

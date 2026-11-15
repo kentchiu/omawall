@@ -10,6 +10,7 @@ use crate::color;
 use crate::config::{self, ColorMode, FAVS, Settings, Source};
 use crate::error::{AppError, Result};
 use crate::image;
+use crate::pages;
 use crate::paths::Paths;
 use crate::select::{self, Rng};
 use crate::state::{self, Current, Favorite, Favorites, LastError, Seen, Status, push_unique};
@@ -279,7 +280,12 @@ impl App {
                 continue;
             };
             let query = self.query(source, &s.settings, color);
-            let pick = select::pick_tag(&*self.transport, &query, &mut s.seen, current)?;
+            let pages_dir = self.paths.pages_dir();
+            let mut search = |q: &Query, page: u64| {
+                pages::search(&*self.transport, &*self.clock, &pages_dir, q, page)
+                    .map(|(found, _)| found)
+            };
+            let pick = select::pick_tag(&mut search, &query, &mut s.seen, current)?;
             if let Some(total) = pick.total {
                 s.status.totals.insert(query.key(), total);
             }
@@ -323,7 +329,7 @@ impl App {
             Target::Reapply(cur)
         } else {
             Target::Remote {
-                item: wallhaven::detail(&*self.transport, id)?,
+                item: pages::detail(&*self.transport, &*self.clock, &self.paths.pages_dir(), id)?,
                 source: None,
             }
         };
@@ -419,7 +425,7 @@ impl App {
                 .collect();
             return Ok(output(json!({
                 "source": key, "page": page, "lastPage": total.div_ceil(PER_PAGE).max(1),
-                "total": total, "items": items,
+                "total": total, "items": items, "cached": false,
             })));
         }
 
@@ -429,16 +435,22 @@ impl App {
             .find(|src| src.key == key)
             .ok_or_else(|| AppError::usage(format!("Unknown source: {key}")))?;
         let query = self.query(source, &s.settings, self.color(&s.settings));
-        let result = wallhaven::search(&*self.transport, &query, page)?;
+        let (result, cached) = pages::search(
+            &*self.transport,
+            &*self.clock,
+            &self.paths.pages_dir(),
+            &query,
+            page,
+        )?;
         let thumbs =
             image::ensure_thumbs(&*self.transport, &result.items, &self.paths.thumbs_dir());
         let mut items = Vec::with_capacity(result.items.len());
         for (item, thumb) in result.items.iter().zip(thumbs) {
+            // A thumbnail that cannot be fetched leaves its card blank; only a disk error fails
+            // the page, so a saved page still shows while Wallhaven is down.
             let thumb = match thumb {
                 Ok(path) => Some(path.display().to_string()),
-                Err(e) if matches!(e.code, "network" | "timeout" | "rate_limited" | "io") => {
-                    return Err(e);
-                }
+                Err(e) if e.code == "io" => return Err(e),
                 Err(_) => None,
             };
             items.push(entry(
@@ -456,7 +468,7 @@ impl App {
         }
         Ok(output(json!({
             "source": key, "page": page, "lastPage": result.last_page,
-            "total": result.total, "items": items,
+            "total": result.total, "items": items, "cached": cached,
         })))
     }
 
@@ -979,6 +991,37 @@ pub mod tests {
         let out = run(&app, &["browse", "favs", "--page", "2"]).unwrap();
         assert_eq!(out["lastPage"], 1);
         assert_eq!(out["items"], json!([]));
+    }
+
+    #[test]
+    fn browse_apply_and_next_keep_working_from_saved_pages_while_wallhaven_is_down() {
+        let t = std::sync::Arc::new(landscape(&["aa1", "aa2"]));
+        let mut app = test_app("app-offline", FakeTransport::default());
+        app.transport = Box::new(t.clone());
+        run(&app, &["set", "sources", "landscape"]).unwrap();
+        assert_eq!(
+            run(&app, &["browse", "landscape"]).unwrap()["cached"],
+            false
+        );
+
+        // The API goes down; the image servers still answer.
+        let q = Query {
+            tag: 711,
+            categories: "100",
+            color: None,
+        };
+        t.add(&q.url(1), 502, Vec::new());
+        t.add("https://wallhaven.cc/api/v1/w/aa2", 525, Vec::new());
+        let saved = run(&app, &["browse", "landscape"]).unwrap();
+        assert_eq!(saved["cached"], true);
+        assert_eq!(saved["items"][1]["id"], "aa2");
+        assert!(saved["items"][1]["thumb"].is_string());
+
+        assert_eq!(
+            run(&app, &["apply", "aa2"]).unwrap()["current"]["id"],
+            "aa2"
+        );
+        assert_eq!(run(&app, &["next"]).unwrap()["current"]["id"], "aa1");
     }
 
     #[test]

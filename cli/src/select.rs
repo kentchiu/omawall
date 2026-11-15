@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::Result;
 use crate::state::{Favorite, Favorites, QueryCursor, Seen, push_unique};
-use crate::wallhaven::{self, Item, Query, Transport};
+use crate::wallhaven::{self, Item, Query, SearchPage};
 
 const MAX_PAGE_FETCHES: usize = 3;
 
@@ -55,8 +55,9 @@ pub struct TagPick {
 /// Walks the query cursor (at most 3 fetches, one reset past `last_page`), skipping
 /// ids in `seen.all` before the reset and the `current` id, and records the picked id in the
 /// cursor and in `seen.all`.
+/// `search` fetches one page; callers pass Wallhaven with a fallback to saved pages.
 pub fn pick_tag(
-    transport: &dyn Transport,
+    search: &mut dyn FnMut(&Query, u64) -> Result<SearchPage>,
     query: &Query,
     seen: &mut Seen,
     current: Option<&str>,
@@ -86,7 +87,7 @@ pub fn pick_tag(
             break;
         }
         fetches += 1;
-        let result = wallhaven::search(transport, query, page)?;
+        let result = search(query, page)?;
         total = Some(result.total);
         if result.total == 0 {
             break;
@@ -179,7 +180,13 @@ mod tests {
         let mut seen = Seen::default();
         let mut picks = Vec::new();
         for _ in 0..4 {
-            let pick = pick_tag(&t, &query(), &mut seen, None).unwrap();
+            let pick = pick_tag(
+                &mut |q, p| wallhaven::search(&t, q, p),
+                &query(),
+                &mut seen,
+                None,
+            )
+            .unwrap();
             assert_eq!(pick.total, Some(4));
             picks.push(pick.item.unwrap().id);
         }
@@ -202,7 +209,13 @@ mod tests {
                 ids: vec!["aa1".into(), "aa2".into(), "bb1".into(), "bb2".into()],
             },
         );
-        let pick = pick_tag(&t, &query(), &mut seen, None).unwrap();
+        let pick = pick_tag(
+            &mut |q, p| wallhaven::search(&t, q, p),
+            &query(),
+            &mut seen,
+            None,
+        )
+        .unwrap();
         assert_eq!(pick.item.unwrap().id, "aa1");
         let cursor = &seen.queries[&query().key()];
         assert_eq!(
@@ -219,16 +232,27 @@ mod tests {
         t.add(&page_url(1), 200, search_json(&["aa2"], 1, 1));
         t.add(&page_url(2), 200, search_json(&[], 1, 1));
         let mut seen = Seen::default();
-        let pick = pick_tag(&t, &query(), &mut seen, Some("aa2")).unwrap();
+        let pick = pick_tag(
+            &mut |q, p| wallhaven::search(&t, q, p),
+            &query(),
+            &mut seen,
+            Some("aa2"),
+        )
+        .unwrap();
         assert!(pick.item.is_none());
         assert_eq!(t.calls().len(), 2, "one reset retry, then stop");
 
         assert_eq!(
-            pick_tag(&t, &query(), &mut seen, None)
-                .unwrap()
-                .item
-                .unwrap()
-                .id,
+            pick_tag(
+                &mut |q, p| wallhaven::search(&t, q, p),
+                &query(),
+                &mut seen,
+                None
+            )
+            .unwrap()
+            .item
+            .unwrap()
+            .id,
             "aa2"
         );
     }
@@ -240,7 +264,13 @@ mod tests {
             t.add(&page_url(p), 200, search_json(&["dd1"], 5, 5));
         }
         let mut seen = Seen::default();
-        let pick = pick_tag(&t, &query(), &mut seen, Some("dd1")).unwrap();
+        let pick = pick_tag(
+            &mut |q, p| wallhaven::search(&t, q, p),
+            &query(),
+            &mut seen,
+            Some("dd1"),
+        )
+        .unwrap();
         assert!(pick.item.is_none());
         assert_eq!(t.calls().len(), 3);
         assert_eq!(seen.queries[&query().key()].page, 4);
@@ -251,7 +281,13 @@ mod tests {
         let t = FakeTransport::default();
         t.add(&page_url(1), 200, search_json(&[], 0, 0));
         let mut seen = Seen::default();
-        let pick = pick_tag(&t, &query(), &mut seen, None).unwrap();
+        let pick = pick_tag(
+            &mut |q, p| wallhaven::search(&t, q, p),
+            &query(),
+            &mut seen,
+            None,
+        )
+        .unwrap();
         assert!(pick.item.is_none());
         assert_eq!(pick.total, Some(0));
         assert_eq!(t.calls().len(), 1);
@@ -266,10 +302,15 @@ mod tests {
             ..Seen::default()
         };
         let mut pick = || {
-            pick_tag(&t, &query(), &mut seen, None)
-                .unwrap()
-                .item
-                .map(|item| item.id)
+            pick_tag(
+                &mut |q, p| wallhaven::search(&t, q, p),
+                &query(),
+                &mut seen,
+                None,
+            )
+            .unwrap()
+            .item
+            .map(|item| item.id)
         };
         // aa1 was shown from another tag or filter, so this query skips it.
         assert_eq!(pick().as_deref(), Some("aa2"));

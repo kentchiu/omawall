@@ -18,6 +18,8 @@ optional timer. No API key is needed.
 - Open the thumbnails folder in your file manager with the folder icon next to it.
 - Favorite a wallpaper to keep a copy in `~/Pictures/Wallpapers/wallhaven/`.
 - An applied wallpaper is not picked again until its source has been shown in full.
+- Every page you browse or sync is saved, so browsing, applying and Next keep working from saved pages
+  while Wallhaven's API is down.
 - Change the wallpaper on a timer (5–1440 minutes).
 
 ## Requirements
@@ -90,7 +92,7 @@ Wallhaven tag page (`https://wallhaven.cc/tag/711` → `711`).
 |---|---|
 | Config (optional) | `~/.config/omawall/config.json` |
 | State | `~/.local/state/omawall/` |
-| Cache | `~/.cache/omawall/` (20 full images, thumbnails up to 2 GiB) |
+| Cache | `~/.cache/omawall/` (20 full images, thumbnails up to 2 GiB, saved pages) |
 | Favorites | `~/Pictures/Wallpapers/wallhaven/` |
 
 ## How it works

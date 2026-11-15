@@ -46,6 +46,11 @@ impl Paths {
     pub fn thumbs_dir(&self) -> PathBuf {
         self.cache_dir.join("thumbs")
     }
+
+    /// Saved search pages, one folder per query key.
+    pub fn pages_dir(&self) -> PathBuf {
+        self.cache_dir.join("pages")
+    }
 }
 
 /// XDG base dir: the variable when it holds an absolute path, else `$HOME/<fallback>`.
