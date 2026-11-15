@@ -1,0 +1,20 @@
+#!/bin/bash
+# Build the omawall CLI from this checkout and install it at ~/.local/bin/omawall.
+# The plugin compares this binary's version with manifest.json, so rerun after updates.
+set -euo pipefail
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+target_dir="${XDG_CACHE_HOME:-$HOME/.cache}/omawall/target"
+dest="$HOME/.local/bin/omawall"
+
+# Build outside the checkout: the shell hot-reloads on any write under its plugins dir.
+cargo build --release --locked --manifest-path "$repo/cli/Cargo.toml" --target-dir "$target_dir"
+built="$target_dir/release/omawall"
+
+install -Dm755 -- "$built" "$dest"
+[[ $(sha256sum <"$built") == $(sha256sum <"$dest") ]] || { echo "install-cli: copied binary differs from build" >&2; exit 1; }
+
+want=$(jq -r .version "$repo/manifest.json")
+got=$("$dest" --version | awk '{print $2}')
+[[ $got == "$want" ]] || { echo "install-cli: CLI $got does not match plugin $want" >&2; exit 1; }
+echo "Installed omawall $got at $dest"

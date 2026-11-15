@@ -1,0 +1,971 @@
+use std::fs;
+use std::path::Path;
+use std::process::{Command as Process, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::{Map, Value, json};
+
+use crate::cache;
+use crate::color;
+use crate::config::{self, ColorMode, FAVS, Settings, Source};
+use crate::error::{AppError, Result};
+use crate::image;
+use crate::paths::Paths;
+use crate::select::{self, Exclusions, Rng};
+use crate::state::{
+    self, Current, Disliked, Favorite, Favorites, LastError, Seen, Status, push_unique,
+};
+use crate::wallhaven::{self, Item, Query, Transport, UreqTransport};
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+const PER_PAGE: usize = 24;
+
+pub type Output = Map<String, Value>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    Manual,
+    Timer,
+}
+
+impl Trigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Trigger::Manual => "manual",
+            Trigger::Timer => "timer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    Status,
+    Next(Trigger),
+    Apply(String),
+    Dislike,
+    Fav,
+    Browse { source: String, page: u64 },
+    Set { name: String, value: String },
+}
+
+impl Command {
+    fn trigger(&self) -> Trigger {
+        match self {
+            Command::Next(trigger) => *trigger,
+            _ => Trigger::Manual,
+        }
+    }
+
+    /// `browse`, `fav` and `set` never notify.
+    fn notifies(&self) -> bool {
+        !matches!(
+            self,
+            Command::Browse { .. } | Command::Fav | Command::Set { .. } | Command::Status
+        )
+    }
+}
+
+const USAGE: &str = "用法：omawall status | next [--trigger manual|timer] | apply <id> [--trigger manual] | dislike | fav | browse <來源|favs> [--page N] | set <名稱> <值> | --version";
+
+fn usage() -> AppError {
+    AppError::usage(USAGE)
+}
+
+/// Parses argv (without the program name).
+pub fn parse_args(args: &[String]) -> Result<Command> {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let command = match args.as_slice() {
+        ["status"] => Command::Status,
+        ["next"] => Command::Next(Trigger::Manual),
+        ["next", "--trigger", t] => Command::Next(match *t {
+            "manual" => Trigger::Manual,
+            "timer" => Trigger::Timer,
+            _ => return Err(usage()),
+        }),
+        ["apply", id] | ["apply", id, "--trigger", "manual"] => {
+            if !wallhaven::is_valid_id(id) {
+                return Err(AppError::usage(format!("桌布 id 無效：{id}")));
+            }
+            Command::Apply(id.to_string())
+        }
+        ["dislike"] => Command::Dislike,
+        ["fav"] => Command::Fav,
+        ["browse", source] => Command::Browse {
+            source: source.to_string(),
+            page: 1,
+        },
+        ["browse", source, "--page", n] => Command::Browse {
+            source: source.to_string(),
+            page: n
+                .parse()
+                .ok()
+                .filter(|&p| p >= 1)
+                .ok_or_else(|| AppError::usage("--page 必須是正整數"))?,
+        },
+        ["set", name, value] => Command::Set {
+            name: name.to_string(),
+            value: value.to_string(),
+        },
+        _ => return Err(usage()),
+    };
+    Ok(command)
+}
+
+/// The single stdout JSON object and the exit code.
+pub fn render(result: Result<Output>) -> (String, i32) {
+    match result {
+        Ok(fields) => {
+            let mut out = Map::new();
+            out.insert("ok".into(), true.into());
+            out.extend(fields);
+            (Value::Object(out).to_string(), 0)
+        }
+        Err(e) => {
+            let out = json!({"ok": false, "error": {"code": e.code, "message": e.message}});
+            (out.to_string(), e.exit_code())
+        }
+    }
+}
+
+fn output(value: Value) -> Output {
+    match value {
+        Value::Object(map) => map,
+        _ => unreachable!("command outputs are objects"),
+    }
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn no_current() -> AppError {
+    AppError::new("not_found", "目前沒有套用中的桌布")
+}
+
+/// What `next`/`apply` will put on the desktop.
+enum Target {
+    Remote { item: Item, source: Option<String> },
+    Favorite(Favorite),
+    Reapply(Current),
+}
+
+/// Everything a command reads from disk.
+struct Store {
+    sources: Vec<Source>,
+    settings: Settings,
+    seen: Seen,
+    disliked: Disliked,
+    favorites: Favorites,
+    status: Status,
+}
+
+pub struct App {
+    pub paths: Paths,
+    pub transport: Box<dyn Transport>,
+    pub bg_set: String,
+    pub notifier: String,
+    pub lock_wait: Duration,
+}
+
+impl App {
+    pub fn new(paths: Paths) -> Self {
+        Self {
+            paths,
+            transport: Box::new(UreqTransport::new()),
+            bg_set: "omarchy-theme-bg-set".into(),
+            notifier: "omarchy-notification-send".into(),
+            lock_wait: Duration::from_secs(10),
+        }
+    }
+
+    pub fn run(&self, command: Command) -> Result<Output> {
+        if command == Command::Status {
+            return self.status();
+        }
+        let trigger = command.trigger();
+        let notifies = command.notifies();
+        let result = state::acquire_lock(&self.paths.state_dir, self.lock_wait).and_then(|_lock| {
+            let result = self.dispatch(command);
+            if let Err(e) = &result
+                && e.code != "usage"
+            {
+                self.record_error(e, trigger);
+            }
+            result
+        });
+        if let Err(e) = &result
+            && notifies
+            && trigger == Trigger::Manual
+            && e.code != "usage"
+        {
+            self.notify(&e.message);
+        }
+        result
+    }
+
+    fn dispatch(&self, command: Command) -> Result<Output> {
+        match command {
+            Command::Status => self.status(),
+            Command::Next(_) => self.next(),
+            Command::Apply(id) => self.apply(&id),
+            Command::Dislike => self.dislike(),
+            Command::Fav => self.fav(),
+            Command::Browse { source, page } => self.browse(&source, page),
+            Command::Set { name, value } => self.set(&name, &value),
+        }
+    }
+
+    // ----- commands -----
+
+    fn status(&self) -> Result<Output> {
+        let s = self.load()?;
+        let color = self.color(&s.settings);
+        let sources: Vec<Value> = s
+            .sources
+            .iter()
+            .map(|src| {
+                let key = self.query(src, &s.settings, color).key();
+                json!({
+                    "key": src.key, "label": src.label, "tag": src.tag,
+                    "selected": s.settings.is_selected(&src.key),
+                    "total": s.status.totals.get(&key),
+                })
+            })
+            .collect();
+        Ok(output(json!({
+            "version": VERSION,
+            "status": s.status,
+            "settings": s.settings,
+            "sources": sources,
+            "favorites": {"count": s.favorites.items.len(), "selected": s.settings.is_selected(FAVS)},
+        })))
+    }
+
+    fn next(&self) -> Result<Output> {
+        let mut s = self.load()?;
+        let color = self.color(&s.settings);
+        let current = s.status.current_id().map(str::to_owned);
+        let current = current.as_deref();
+        let mut keys = s.settings.sources.clone();
+        Rng::from_time().shuffle(&mut keys);
+
+        let mut target = None;
+        for key in &keys {
+            if key == FAVS {
+                if select::has_other_favorite(&s.favorites, current)
+                    && let Some(fav) = select::pick_fav(&s.favorites, &mut s.seen, current)
+                {
+                    target = Some(Target::Favorite(fav));
+                    break;
+                }
+                continue;
+            }
+            let Some(source) = s.sources.iter().find(|src| &src.key == key) else {
+                continue;
+            };
+            let query = self.query(source, &s.settings, color);
+            let ex = Exclusions {
+                disliked: &s.disliked,
+                current,
+            };
+            let pick = select::pick_tag(&*self.transport, &query, &mut s.seen, &ex)?;
+            if let Some(total) = pick.total {
+                s.status.totals.insert(query.key(), total);
+            }
+            if let Some(item) = pick.item {
+                target = Some(Target::Remote {
+                    item,
+                    source: Some(key.clone()),
+                });
+                break;
+            }
+        }
+
+        let Some(target) = target else {
+            self.save(&s.seen, "seen.json")?;
+            self.write_status(&mut s.status)?;
+            return Err(AppError::new(
+                "no_candidates",
+                "找不到可用的桌布，請調整來源或篩選條件",
+            ));
+        };
+        let applied = self.apply_target(target)?;
+        self.save(&s.seen, "seen.json")?;
+        self.finish_apply(&mut s.status, applied)
+    }
+
+    fn apply(&self, id: &str) -> Result<Output> {
+        let mut s = self.load()?;
+        let favorite = s
+            .favorites
+            .items
+            .iter()
+            .find(|f| f.id == id && Path::new(&f.path).is_file());
+        let target = if let Some(fav) = favorite {
+            Target::Favorite(fav.clone())
+        } else if let Some(cur) = s
+            .status
+            .current
+            .clone()
+            .filter(|c| c.id == id && Path::new(&c.path).is_file())
+        {
+            Target::Reapply(cur)
+        } else {
+            Target::Remote {
+                item: wallhaven::detail(&*self.transport, id)?,
+                source: None,
+            }
+        };
+        let applied = self.apply_target(target)?;
+        push_unique(&mut s.seen.all, id);
+        self.save(&s.seen, "seen.json")?;
+        self.finish_apply(&mut s.status, applied)
+    }
+
+    fn dislike(&self) -> Result<Output> {
+        let mut s = self.load()?;
+        let id = s.status.current_id().ok_or_else(no_current)?.to_string();
+        push_unique(&mut s.disliked.ids, &id);
+        self.save(&s.disliked, "disliked.json")?;
+        if s.favorites.contains(&id) {
+            self.remove_favorite(&id, &mut s.favorites, &mut s.status)?;
+            self.save(&s.favorites, "favorites.json")?;
+            self.write_status(&mut s.status)?;
+        }
+        self.next()
+    }
+
+    fn fav(&self) -> Result<Output> {
+        let mut s = self.load()?;
+        let cur = s.status.current.clone().ok_or_else(no_current)?;
+        if !wallhaven::is_valid_id(&cur.id) {
+            return Err(AppError::new("io", "status.json 的桌布 id 無效"));
+        }
+        let favorite = if s.favorites.contains(&cur.id) {
+            self.remove_favorite(&cur.id, &mut s.favorites, &mut s.status)?;
+            false
+        } else {
+            let src = Path::new(&cur.path);
+            if !src.is_file() {
+                return Err(AppError::new("not_found", "找不到目前桌布的圖片檔"));
+            }
+            let ext = image::detect_file(src)?;
+            let dest = self
+                .paths
+                .favorites_dir
+                .join(format!("wallhaven-{}.{ext}", cur.id));
+            if dest != src {
+                let bytes = fs::read(src)
+                    .map_err(|e| AppError::io(format!("無法讀取 {}", src.display()), e))?;
+                state::write_atomic(&dest, &bytes)?;
+            }
+            let thumb = self.current_thumb(&cur);
+            if let Some(c) = s.status.current.as_mut() {
+                c.thumb = thumb.clone();
+            }
+            s.favorites.items.insert(
+                0,
+                Favorite {
+                    id: cur.id.clone(),
+                    path: dest.display().to_string(),
+                    thumb,
+                    resolution: cur.resolution.clone(),
+                    favorites: cur.favorites,
+                    file_size: cur.file_size,
+                    added_at: now(),
+                },
+            );
+            s.disliked.ids.retain(|x| x != &cur.id);
+            self.save(&s.disliked, "disliked.json")?;
+            true
+        };
+        self.save(&s.favorites, "favorites.json")?;
+        self.write_status(&mut s.status)?;
+        Ok(output(
+            json!({"favorite": favorite, "current": s.status.current}),
+        ))
+    }
+
+    fn browse(&self, key: &str, page: u64) -> Result<Output> {
+        let mut s = self.load()?;
+        let current = s.status.current_id().map(str::to_owned);
+        let entry = |id: &str,
+                     thumb: Option<String>,
+                     resolution: &str,
+                     favorites: u64,
+                     file_size: u64| {
+            json!({
+                "id": id, "thumb": thumb, "resolution": resolution, "favorites": favorites, "fileSize": file_size,
+                "seen": s.seen.all.iter().any(|x| x == id),
+                "disliked": s.disliked.contains(id),
+                "favorite": s.favorites.contains(id),
+                "current": current.as_deref() == Some(id),
+            })
+        };
+
+        if key == FAVS {
+            let total = s.favorites.items.len();
+            let skip = usize::try_from(page - 1)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(PER_PAGE);
+            let items: Vec<Value> = s
+                .favorites
+                .items
+                .iter()
+                .skip(skip)
+                .take(PER_PAGE)
+                .map(|f| {
+                    let thumb = f.thumb.clone().filter(|t| Path::new(t).is_file());
+                    entry(&f.id, thumb, &f.resolution, f.favorites, f.file_size)
+                })
+                .collect();
+            return Ok(output(json!({
+                "source": key, "page": page, "lastPage": total.div_ceil(PER_PAGE).max(1),
+                "total": total, "items": items,
+            })));
+        }
+
+        let source = s
+            .sources
+            .iter()
+            .find(|src| src.key == key)
+            .ok_or_else(|| AppError::usage(format!("未知的來源：{key}")))?;
+        let query = self.query(source, &s.settings, self.color(&s.settings));
+        let result = wallhaven::search(&*self.transport, &query, page)?;
+        let mut items = Vec::with_capacity(result.items.len());
+        for item in &result.items {
+            let thumb = match image::ensure_thumb(&*self.transport, item, &self.paths.thumbs_dir())
+            {
+                Ok(path) => Some(path.display().to_string()),
+                Err(e) if matches!(e.code, "network" | "timeout" | "rate_limited" | "io") => {
+                    return Err(e);
+                }
+                Err(_) => None,
+            };
+            items.push(entry(
+                &item.id,
+                thumb,
+                &item.resolution,
+                item.favorites,
+                item.file_size,
+            ));
+        }
+        cache::evict_thumbs(&self.paths.thumbs_dir(), cache::THUMBS_MAX_BYTES);
+        s.status.totals.insert(query.key(), result.total);
+        self.write_status(&mut s.status)?;
+        Ok(output(json!({
+            "source": key, "page": page, "lastPage": result.last_page,
+            "total": result.total, "items": items,
+        })))
+    }
+
+    fn set(&self, name: &str, value: &str) -> Result<Output> {
+        let mut s = self.load()?;
+        s.settings.set(name, value, &s.sources)?;
+        self.save(&s.settings, "settings.json")?;
+        self.write_status(&mut s.status)?;
+        Ok(output(json!({"settings": s.settings})))
+    }
+
+    // ----- helpers -----
+
+    fn load(&self) -> Result<Store> {
+        let sources = config::load_sources(&self.paths.config_file)?;
+        let settings = Settings::load(&self.paths.state("settings.json"), &sources)?;
+        Ok(Store {
+            sources,
+            settings,
+            seen: state::read_json(&self.paths.state("seen.json"))?,
+            disliked: state::read_json(&self.paths.state("disliked.json"))?,
+            favorites: state::read_json(&self.paths.state("favorites.json"))?,
+            status: state::read_json(&self.paths.state("status.json"))?,
+        })
+    }
+
+    fn save<T: serde::Serialize>(&self, value: &T, name: &str) -> Result<()> {
+        state::write_json(&self.paths.state(name), value)
+    }
+
+    fn write_status(&self, status: &mut Status) -> Result<()> {
+        status.updated_at = now();
+        self.save(status, "status.json")
+    }
+
+    fn color(&self, settings: &Settings) -> Option<&'static str> {
+        match settings.color {
+            ColorMode::Theme => color::theme_color(&self.paths.theme_colors),
+            ColorMode::None => None,
+        }
+    }
+
+    fn query(&self, source: &Source, settings: &Settings, color: Option<&'static str>) -> Query {
+        Query {
+            tag: source.tag,
+            categories: settings.categories(),
+            color,
+        }
+    }
+
+    /// Downloads if needed and runs `omarchy-theme-bg-set`.
+    fn apply_target(&self, target: Target) -> Result<Current> {
+        let current = match target {
+            Target::Remote { item, source } => {
+                let path = image::ensure_full(&*self.transport, &item, &self.paths.full_dir())?;
+                let thumb =
+                    image::ensure_thumb(&*self.transport, &item, &self.paths.thumbs_dir()).ok();
+                Current {
+                    url: format!("https://wallhaven.cc/w/{}", item.id),
+                    id: item.id,
+                    source,
+                    path: path.display().to_string(),
+                    thumb: thumb.map(|p| p.display().to_string()),
+                    resolution: item.resolution,
+                    favorites: item.favorites,
+                    file_size: item.file_size,
+                    applied_at: 0,
+                }
+            }
+            Target::Favorite(fav) => Current {
+                url: format!("https://wallhaven.cc/w/{}", fav.id),
+                id: fav.id,
+                source: Some(FAVS.into()),
+                path: fav.path,
+                thumb: fav.thumb.filter(|t| Path::new(t).is_file()),
+                resolution: fav.resolution,
+                favorites: fav.favorites,
+                file_size: fav.file_size,
+                applied_at: 0,
+            },
+            Target::Reapply(current) => current,
+        };
+        self.set_wallpaper(Path::new(&current.path))?;
+        Ok(Current {
+            applied_at: now(),
+            ..current
+        })
+    }
+
+    fn finish_apply(&self, status: &mut Status, current: Current) -> Result<Output> {
+        let full = Path::new(&current.path).to_path_buf();
+        status.current = Some(current);
+        status.last_error = None;
+        self.write_status(status)?;
+        cache::evict_full(&self.paths.full_dir(), cache::FULL_KEEP, Some(&full));
+        cache::evict_thumbs(&self.paths.thumbs_dir(), cache::THUMBS_MAX_BYTES);
+        Ok(output(json!({"current": status.current})))
+    }
+
+    fn set_wallpaper(&self, path: &Path) -> Result<()> {
+        let status = Process::new(&self.bg_set)
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .map_err(|e| AppError::new("set_failed", format!("無法執行 {}：{e}", self.bg_set)))?;
+        if !status.success() {
+            let code = status.code().map_or("無".to_string(), |c| c.to_string());
+            return Err(AppError::new(
+                "set_failed",
+                format!("{} 執行失敗（結束代碼 {code}）", self.bg_set),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Existing thumbnail of the current wallpaper, downloading it if missing (best effort).
+    fn current_thumb(&self, cur: &Current) -> Option<String> {
+        if let Some(thumb) = cur.thumb.as_ref().filter(|t| Path::new(t).is_file()) {
+            return Some(thumb.clone());
+        }
+        if let Some(path) = image::cached(&self.paths.thumbs_dir(), &cur.id) {
+            return Some(path.display().to_string());
+        }
+        let item = wallhaven::detail(&*self.transport, &cur.id).ok()?;
+        let path = image::ensure_thumb(&*self.transport, &item, &self.paths.thumbs_dir()).ok()?;
+        Some(path.display().to_string())
+    }
+
+    /// Drops the favorite entry and deletes only `<favorites>/wallhaven-<id>.<jpg|png>`.
+    /// If that file is the current wallpaper, a copy is kept in the full cache first.
+    fn remove_favorite(
+        &self,
+        id: &str,
+        favorites: &mut Favorites,
+        status: &mut Status,
+    ) -> Result<()> {
+        favorites.items.retain(|f| f.id != id);
+        if !wallhaven::is_valid_id(id) {
+            return Ok(());
+        }
+        for ext in image::EXTENSIONS {
+            let name = format!("wallhaven-{id}.{ext}");
+            let file = self.paths.favorites_dir.join(&name);
+            if !file.is_file() {
+                continue;
+            }
+            let io = |e| AppError::io(format!("無法處理 {}", file.display()), e);
+            if let Some(cur) = status
+                .current
+                .as_mut()
+                .filter(|c| Path::new(&c.path) == file)
+            {
+                let keep = self.paths.full_dir().join(&name);
+                if !keep.is_file() {
+                    state::write_atomic(&keep, &fs::read(&file).map_err(io)?)?;
+                }
+                // Repoint the desktop before its file disappears; on failure nothing is deleted.
+                self.set_wallpaper(&keep)?;
+                cur.path = keep.display().to_string();
+            }
+            fs::remove_file(&file).map_err(io)?;
+        }
+        Ok(())
+    }
+
+    /// Stores the failure in `status.json`; best effort.
+    fn record_error(&self, err: &AppError, trigger: Trigger) {
+        let Ok(mut status) = state::read_json::<Status>(&self.paths.state("status.json")) else {
+            return;
+        };
+        status.last_error = Some(LastError {
+            code: err.code.into(),
+            message: err.message.clone(),
+            trigger: trigger.as_str().into(),
+            at: now(),
+        });
+        let _ = self.write_status(&mut status);
+    }
+
+    fn notify(&self, message: &str) {
+        let _ = Process::new(&self.notifier)
+            .args(["--app-name", "omawall", "換桌布失敗", message])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{FakeTransport, JPEG, PNG, temp_dir};
+    use crate::wallhaven::tests::{item_json, search_json};
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn test_app(name: &str, transport: FakeTransport) -> App {
+        let root = temp_dir(name);
+        let paths = Paths::new(
+            &root.join("home"),
+            &root.join("config"),
+            &root.join("state"),
+            &root.join("cache"),
+        );
+        App {
+            paths,
+            transport: Box::new(transport),
+            bg_set: "true".into(),
+            notifier: "true".into(),
+            // Parallel tests fork children that briefly inherit lock fds, so allow a wait.
+            lock_wait: Duration::from_secs(5),
+        }
+    }
+
+    /// Fake Wallhaven serving `landscape` (tag 711) page 1 with the given ids.
+    fn landscape(ids: &[&str]) -> FakeTransport {
+        let t = FakeTransport::default();
+        let q = Query {
+            tag: 711,
+            categories: "100",
+            color: None,
+        };
+        t.add(&q.url(1), 200, search_json(ids, 1, ids.len() as u64));
+        for id in ids {
+            let item = item_json(id);
+            t.add(item["path"].as_str().unwrap(), 200, JPEG.to_vec());
+            t.add(item["thumbs"]["large"].as_str().unwrap(), 200, PNG.to_vec());
+            t.add(
+                &format!("https://wallhaven.cc/api/v1/w/{id}"),
+                200,
+                serde_json::to_vec(&json!({"data": item})).unwrap(),
+            );
+        }
+        t
+    }
+
+    fn run(app: &App, list: &[&str]) -> Result<Output> {
+        app.run(parse_args(&args(list))?)
+    }
+
+    fn status_of(app: &App) -> Status {
+        state::read_json(&app.paths.state("status.json")).unwrap()
+    }
+
+    #[test]
+    fn parse_and_usage_errors() {
+        assert_eq!(
+            parse_args(&args(&["next"])).unwrap(),
+            Command::Next(Trigger::Manual)
+        );
+        assert_eq!(
+            parse_args(&args(&["next", "--trigger", "timer"])).unwrap(),
+            Command::Next(Trigger::Timer)
+        );
+        assert_eq!(
+            parse_args(&args(&["browse", "favs", "--page", "3"])).unwrap(),
+            Command::Browse {
+                source: "favs".into(),
+                page: 3
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["apply", "abc", "--trigger", "manual"])).unwrap(),
+            Command::Apply("abc".into())
+        );
+        for bad in [
+            &[][..],
+            &["nope"],
+            &["next", "--trigger", "cron"],
+            &["apply", "../x"],
+            &["apply", "abc", "--trigger", "timer"],
+            &["browse", "favs", "--page", "0"],
+            &["set", "color"],
+            &["status", "extra"],
+        ] {
+            assert_eq!(parse_args(&args(bad)).unwrap_err().code, "usage", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn envelope_and_exit_codes() {
+        let (out, code) = render(Ok(output(json!({"skipped": true}))));
+        assert_eq!(code, 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            json!({"ok": true, "skipped": true})
+        );
+
+        let (out, code) = render(Err(AppError::usage("x")));
+        assert_eq!(code, 2);
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            json!({"ok": false, "error": {"code": "usage", "message": "x"}})
+        );
+        assert_eq!(render(Err(AppError::new("network", "y"))).1, 1);
+        assert!(!out.contains('\n'));
+    }
+
+    #[test]
+    fn status_defaults() {
+        let app = test_app("app-status", FakeTransport::default());
+        let out = run(&app, &["status"]).unwrap();
+        assert_eq!(out["version"], VERSION);
+        assert_eq!(out["status"]["current"], Value::Null);
+        assert_eq!(out["sources"].as_array().unwrap().len(), 10);
+        assert_eq!(
+            out["sources"][0],
+            json!({"key":"landscape","label":"風景","tag":711,"selected":true,"total":null})
+        );
+        assert_eq!(out["favorites"], json!({"count": 0, "selected": false}));
+        assert_eq!(out["settings"]["timer"]["minutes"], 60);
+    }
+
+    #[test]
+    fn next_applies_and_records() {
+        let app = test_app("app-next", landscape(&["aa1", "aa2"]));
+        run(&app, &["set", "sources", "landscape"]).unwrap();
+        let out = run(&app, &["next"]).unwrap();
+        let cur = &out["current"];
+        assert_eq!(cur["id"], "aa1");
+        assert_eq!(cur["source"], "landscape");
+        assert_eq!(cur["url"], "https://wallhaven.cc/w/aa1");
+        assert!(
+            cur["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/full/wallhaven-aa1.jpg")
+        );
+        assert!(cur["thumb"].as_str().unwrap().ends_with("/thumbs/aa1.png"));
+
+        let status = status_of(&app);
+        assert_eq!(status.totals["tag:711|cat:100|color:none"], 2);
+        assert_eq!(run(&app, &["next"]).unwrap()["current"]["id"], "aa2");
+        let seen: Seen = state::read_json(&app.paths.state("seen.json")).unwrap();
+        assert_eq!(seen.all, ["aa1", "aa2"]);
+
+        let out = run(&app, &["status"]).unwrap();
+        assert_eq!(out["sources"][0]["total"], 2);
+    }
+
+    #[test]
+    fn failure_keeps_current_and_records_error() {
+        let mut app = test_app("app-fail", landscape(&["aa1", "aa2"]));
+        run(&app, &["set", "sources", "landscape"]).unwrap();
+        run(&app, &["next"]).unwrap();
+        app.bg_set = "false".into();
+        assert_eq!(run(&app, &["next"]).unwrap_err().code, "set_failed");
+        let status = status_of(&app);
+        assert_eq!(status.current.unwrap().id, "aa1");
+        let err = status.last_error.unwrap();
+        assert_eq!(
+            (err.code.as_str(), err.trigger.as_str()),
+            ("set_failed", "manual")
+        );
+
+        app.bg_set = "true".into();
+        assert_eq!(
+            run(&app, &["next", "--trigger", "timer"]).unwrap()["current"]["id"],
+            "aa2"
+        );
+        assert!(status_of(&app).last_error.is_none());
+    }
+
+    #[test]
+    fn no_candidates_and_busy() {
+        let mut app = test_app("app-empty", FakeTransport::default());
+        run(&app, &["set", "sources", ""]).unwrap();
+        assert_eq!(
+            run(&app, &["next", "--trigger", "timer"]).unwrap_err().code,
+            "no_candidates"
+        );
+        assert_eq!(status_of(&app).last_error.unwrap().trigger, "timer");
+
+        let _held = state::acquire_lock(&app.paths.state_dir, Duration::from_secs(5)).unwrap();
+        app.lock_wait = Duration::ZERO;
+        assert_eq!(run(&app, &["next"]).unwrap_err().code, "busy");
+        // status never takes the lock.
+        assert!(run(&app, &["status"]).is_ok());
+    }
+
+    #[test]
+    fn set_timer_minutes_usage() {
+        let app = test_app("app-set", FakeTransport::default());
+        let err = run(&app, &["set", "timer.minutes", "3"]).unwrap_err();
+        assert_eq!((err.code, err.exit_code()), ("usage", 2));
+        assert!(status_of(&app).last_error.is_none());
+        let out = run(&app, &["set", "timer.minutes", "30"]).unwrap();
+        assert_eq!(out["settings"]["timer"]["minutes"], 30);
+    }
+
+    #[test]
+    fn fav_and_dislike_are_exclusive() {
+        let app = test_app("app-fav", landscape(&["aa1", "aa2", "aa3"]));
+        run(&app, &["set", "sources", "landscape"]).unwrap();
+        assert_eq!(run(&app, &["fav"]).unwrap_err().code, "not_found");
+        run(&app, &["next"]).unwrap();
+
+        // Disliked id that becomes a favorite leaves the dislike list.
+        state::write_json(
+            &app.paths.state("disliked.json"),
+            &Disliked {
+                version: 1,
+                ids: vec!["aa1".into()],
+            },
+        )
+        .unwrap();
+        let out = run(&app, &["fav"]).unwrap();
+        assert_eq!(out["favorite"], true);
+        let fav_file = app.paths.favorites_dir.join("wallhaven-aa1.jpg");
+        assert!(fav_file.is_file());
+        let disliked: Disliked = state::read_json(&app.paths.state("disliked.json")).unwrap();
+        assert!(disliked.ids.is_empty());
+        let favorites: Favorites = state::read_json(&app.paths.state("favorites.json")).unwrap();
+        assert_eq!(favorites.items[0].id, "aa1");
+
+        // Toggle off and on again.
+        assert_eq!(run(&app, &["fav"]).unwrap()["favorite"], false);
+        assert!(!fav_file.exists());
+        assert_eq!(run(&app, &["fav"]).unwrap()["favorite"], true);
+
+        // A stray file not matching the pattern is never touched.
+        let stray = app.paths.favorites_dir.join("aa1.jpg");
+        fs::write(&stray, JPEG).unwrap();
+
+        // Dislike removes the favorite copy and entry, then moves on.
+        let out = run(&app, &["dislike"]).unwrap();
+        assert_eq!(out["current"]["id"], "aa2");
+        assert!(!fav_file.exists());
+        assert!(stray.exists());
+        let favorites: Favorites = state::read_json(&app.paths.state("favorites.json")).unwrap();
+        assert!(favorites.items.is_empty());
+        let disliked: Disliked = state::read_json(&app.paths.state("disliked.json")).unwrap();
+        assert_eq!(disliked.ids, ["aa1"]);
+    }
+
+    #[test]
+    fn favs_source_uses_local_file_and_unfav_keeps_current() {
+        let mut app = test_app("app-favs", landscape(&["aa1", "aa2"]));
+        run(&app, &["set", "sources", "landscape"]).unwrap();
+        run(&app, &["next"]).unwrap();
+        run(&app, &["fav"]).unwrap();
+        run(&app, &["next"]).unwrap();
+        run(&app, &["set", "sources", "favs"]).unwrap();
+        let out = run(&app, &["next"]).unwrap();
+        assert_eq!(out["current"]["source"], "favs");
+        let fav_file = app.paths.favorites_dir.join("wallhaven-aa1.jpg");
+        assert_eq!(out["current"]["path"], fav_file.display().to_string());
+
+        // Only favorite is current → nothing else to show.
+        assert_eq!(run(&app, &["next"]).unwrap_err().code, "no_candidates");
+
+        // Unfav of a favorites-backed current must repoint the desktop first;
+        // if that fails, the favorite file stays.
+        app.bg_set = "false".into();
+        assert_eq!(run(&app, &["fav"]).unwrap_err().code, "set_failed");
+        assert!(fav_file.is_file());
+        app.bg_set = "true".into();
+
+        // Unfav of a favorites-backed current repoints it to the cache copy.
+        let out = run(&app, &["fav"]).unwrap();
+        assert_eq!(out["favorite"], false);
+        let path = out["current"]["path"].as_str().unwrap().to_string();
+        assert!(path.ends_with("/full/wallhaven-aa1.jpg") && Path::new(&path).is_file());
+    }
+
+    #[test]
+    fn browse_tag_and_favs() {
+        let app = test_app("app-browse", landscape(&["aa1", "aa2"]));
+        let out = run(&app, &["browse", "landscape"]).unwrap();
+        assert_eq!(
+            (
+                out["page"].as_u64(),
+                out["lastPage"].as_u64(),
+                out["total"].as_u64()
+            ),
+            (Some(1), Some(1), Some(2))
+        );
+        let first = &out["items"][0];
+        assert_eq!(first["id"], "aa1");
+        assert!(
+            first["thumb"]
+                .as_str()
+                .unwrap()
+                .ends_with("/thumbs/aa1.png")
+        );
+        assert_eq!(
+            (first["seen"].clone(), first["current"].clone()),
+            (json!(false), json!(false))
+        );
+        assert_eq!(status_of(&app).totals["tag:711|cat:100|color:none"], 2);
+        assert_eq!(run(&app, &["browse", "nope"]).unwrap_err().code, "usage");
+
+        let out = run(&app, &["browse", "favs", "--page", "2"]).unwrap();
+        assert_eq!(out["lastPage"], 1);
+        assert_eq!(out["items"], json!([]));
+    }
+
+    #[test]
+    fn apply_by_id() {
+        let app = test_app("app-apply", landscape(&["aa1"]));
+        let out = run(&app, &["apply", "aa1"]).unwrap();
+        assert_eq!(out["current"]["id"], "aa1");
+        assert_eq!(out["current"]["source"], Value::Null);
+        assert_eq!(run(&app, &["apply", "zz9"]).unwrap_err().code, "not_found");
+    }
+}
