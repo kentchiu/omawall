@@ -476,13 +476,15 @@ impl App {
             .find(|src| src.key == key)
             .ok_or_else(|| AppError::usage(format!("Unknown source: {key}")))?;
         let query = self.query(source, &s.settings, self.color(&s.settings));
-        let (result, cached) = pages::search(
-            &*self.transport,
-            &*self.clock,
-            &self.paths.pages_dir(),
-            &query,
-            page,
-        )?;
+        let pages_dir = self.paths.pages_dir();
+        // A synced category is filtered from disk, so browsing it never calls Wallhaven.
+        let local = sync::local_pages(&self.paths, source)?.and_then(|(synced, last)| {
+            pages::filtered(&pages_dir, &synced, last, &query, page, PER_PAGE)
+        });
+        let (result, cached) = match local {
+            Some(found) => (found, false),
+            None => pages::search(&*self.transport, &*self.clock, &pages_dir, &query, page)?,
+        };
         let thumbs =
             image::ensure_thumbs(&*self.transport, &result.items, &self.paths.thumbs_dir());
         let mut items = Vec::with_capacity(result.items.len());

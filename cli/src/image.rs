@@ -227,6 +227,8 @@ mod tests {
                 resolution: "3840x2160".into(),
                 favorites: 1,
                 file_size: 1,
+                category: "general".into(),
+                colors: Vec::new(),
             })
             .collect();
         for item in &items[..9] {

@@ -82,7 +82,7 @@ An invalid config is an error (`config`), never silently replaced.
   `660000 990000 cc0000 cc3333 ea4c88 993399 663399 333399 0066cc 0099cc 66cccc 77cc33 669900 336600 666600 999900 cccc33 ffff00 ffcc33 ff9900 ff6600 cc6633 996633 663300 000000 999999 cccccc ffffff 424153`
   (`#89b4fa` → `66cccc`). Unreadable theme → treat as `none`.
 - No API key. Response JSON limit 2 MiB. Use `meta.last_page`, `meta.total`, and per item
-  `id, path, thumbs.large, resolution, favorites, file_size, file_type`.
+  `id, path, thumbs.large, resolution, favorites, file_size, file_type`, plus `category` and `colors` (kept in saved pages for local filtering; missing ones read as empty).
 - Full image: must be `https://w.wallhaven.cc/full/...`. Thumbnail: must be `https://th.wallhaven.cc/lg/...`.
   Only HTTPS to `wallhaven.cc`, `w.wallhaven.cc`, `th.wallhaven.cc`; never follow redirects elsewhere.
 - Limits: API/thumbnail timeout 15 s, full image 90 s; full ≤ 30 MiB, thumbnail ≤ 1 MiB.
@@ -112,7 +112,7 @@ Error codes: `usage`, `config`, `network`, `timeout`, `rate_limited` (HTTP 429),
 | `omawall next [--trigger manual\|timer]` | yes | applies the next wallpaper; `{ok, current}` |
 | `omawall apply <id> [--trigger manual]` | yes | downloads and applies that id; `{ok, current}` |
 | `omawall fav [<id>]` | no* | toggles favorite for `<id>` (default: current) without applying it; a non-current id is downloaded straight into the favorites dir; `{ok, id, favorite: bool, current}` |
-| `omawall browse <sourceKey\|favs> [--page N]` | yes | `{ok, source, page, lastPage, total, items: [{id, thumb, resolution, favorites, fileSize, seen, favorite, current}], cached}`, 24 per page, thumbnails downloaded first; `cached` is true when the page came from disk; a thumbnail that cannot be fetched is `null` (only `io` fails the page) |
+| `omawall browse <sourceKey\|favs> [--page N]` | yes | `{ok, source, page, lastPage, total, items: [{id, thumb, resolution, favorites, fileSize, seen, favorite, current}], cached}`, 24 per page, thumbnails downloaded first; a source whose sync is `done` is filtered from that sync's saved pages without calling Wallhaven (style by `category`, color by `colors` containing `#<hex>`, an id met twice counted once); `cached` is true when the page came from disk because Wallhaven failed; a thumbnail that cannot be fetched is `null` (only `io` fails the page) |
 | `omawall set <name> <value>` | no | `{ok, settings}`; names: `sources` (comma list, may be empty, may include `favs`), `style.general`, `style.anime` (`true`/`false`), `color` (`none`/`theme`), `timer.enabled` (`true`/`false`), `timer.minutes` (integer 5–1440) |
 
 | `omawall sync <sourceKey>` | yes | long-running: downloads every thumbnail of that tag source (whole category, any filters); progress in `syncs.json`; prints `{ok, sync}` when it ends as `done` or `canceled`, the failure envelope when `failed` |
@@ -129,8 +129,10 @@ The plugin starts it detached (`Quickshell.execDetached`), so it outlives the pa
    `<state>/sync.cancel`. `usage`, `busy` and `config` errors write no `syncs.json`.
 2. Query the whole category, `categories=110` and no color, whatever the settings: every filtered view is a
    subset, so changing styles or color never makes a finished sync stale. Each category has one record:
-   - `done` → print it and stop, with no network: a finished query is never walked again. Wallpapers added
-     later get their thumbnails when browsed.
+   - `done` with `filters` → print it and stop, with no network: a finished query is never walked again.
+     Wallpapers added later do not show in `browse` of that source.
+   - `done` without `filters` (written before 0.3.4, its saved pages lack `category` and `colors`) → start
+     over at page 1.
    - `canceled`, `failed` or a dead `running` → resume at its `page` with `done = pageDone`,
      `skipped = pageSkipped`, so that page is walked again and counted once.
    - none → start at page 1.
@@ -148,17 +150,17 @@ The plugin starts it detached (`Quickshell.execDetached`), so it outlives the pa
    { "version": 1, "queries": { "tag:711|cat:100|color:none": {
        "source": "landscape", "queryKey": "tag:711|cat:100|color:none", "state": "running",
        "done": 120, "skipped": 0, "total": 4071, "page": 6, "lastPage": 170, "pageDone": 120, "pageSkipped": 0,
-       "error": null, "startedAt": 1794700000, "updatedAt": 1794700000 } } }
+       "error": null, "startedAt": 1794700000, "updatedAt": 1794700000, "filters": true } } }
    ```
    `state`: `running`, `done`, `canceled`, `failed`. `done` counts thumbnails now on disk (downloaded or already there).
    `page` is the page being walked (1 before the first page arrives); `pageDone`/`pageSkipped` are the counts
    before it. `total` and `lastPage` are `null` until the first page arrives. `error` is `{code, message}` or
-   `null`. At the end the thumbnail cache is trimmed like `browse`. `sync.json` from 0.2.0 is not read.
+   `null`. `filters` is true when the saved pages carry `category` and `colors`. At the end the thumbnail cache is trimmed like `browse`. `sync.json` from 0.2.0 is not read.
 7. `sync` saves every page it walks, never notifies and never touches `status.json`, `seen.json` or `favorites.json`.
 
 `status.sources[].sync` is that category's record (the whole category, so it does not depend on the filters), or `null`. `status.sync` is the record
 being synced right now, or `null`. A `running` record while `<state>/sync.lock` is free (the process died) is
-reported as `state: "stopped"`.
+reported as `state: "stopped"`, and so is a `done` record without `filters`.
 `sync --cancel` creates `<state>/sync.cancel` only when `sync.lock` is held.
 
 ### `next` selection

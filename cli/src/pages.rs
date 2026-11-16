@@ -1,6 +1,7 @@
 //! Saved search pages. Every page fetched from Wallhaven is kept, so browsing, `next` and
 //! `apply` keep working from the last good copy while the API is down.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -61,6 +62,37 @@ pub fn search(
             .ok_or(e),
         Err(e) => Err(e),
     }
+}
+
+/// Page `page` of `query`, filtered from a synced category's saved pages 1..=`last_page`
+/// without asking Wallhaven; `None` when one of those pages is missing. An id the sync met twice,
+/// because the order shifted while it walked, counts once.
+pub fn filtered(
+    dir: &Path,
+    synced: &Query,
+    last_page: u64,
+    query: &Query,
+    page: u64,
+    per_page: usize,
+) -> Option<SearchPage> {
+    let mut ids = HashSet::new();
+    let mut items = Vec::new();
+    for n in 1..=last_page {
+        for item in load(dir, &synced.key(), n)?.items {
+            if ids.insert(item.id.clone()) && query.admits(&item) {
+                items.push(item);
+            }
+        }
+    }
+    let total = items.len() as u64;
+    let skip = usize::try_from(page.saturating_sub(1))
+        .unwrap_or(usize::MAX)
+        .saturating_mul(per_page);
+    Some(SearchPage {
+        last_page: total.div_ceil(per_page as u64).max(1),
+        total,
+        items: items.into_iter().skip(skip).take(per_page).collect(),
+    })
 }
 
 /// The saved entry for `id`, from any saved page.

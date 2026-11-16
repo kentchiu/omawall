@@ -84,6 +84,10 @@ pub struct SyncState {
     pub error: Option<SyncError>,
     pub started_at: u64,
     pub updated_at: u64,
+    /// The saved pages carry each wallpaper's category and colors, so browse filters them
+    /// locally. Records from before 0.3.4 lack it and are walked again.
+    #[serde(default)]
+    pub filters: bool,
 }
 
 /// `syncs.json`.
@@ -93,17 +97,28 @@ pub struct Syncs {
     pub queries: BTreeMap<String, SyncState>,
 }
 
-/// Every record, with `running` turned into `stopped` when no sync process holds the lock.
+/// Every record, with `running` turned into `stopped` when no sync process holds the lock,
+/// and a finished record without `filters` shown as `stopped`, so it can be synced again.
 pub fn records(paths: &Paths) -> Result<Syncs> {
     let mut syncs = state::read_json::<Syncs>(&paths.state(SYNC_FILE))?;
-    if !state::is_locked(&paths.state(SYNC_LOCK)) {
-        for record in syncs.queries.values_mut() {
-            if record.state == "running" {
-                record.state = "stopped".into();
-            }
+    let locked = state::is_locked(&paths.state(SYNC_LOCK));
+    for record in syncs.queries.values_mut() {
+        if (record.state == "running" && !locked) || (record.state == "done" && !record.filters) {
+            record.state = "stopped".into();
         }
     }
     Ok(syncs)
+}
+
+/// The query and last page of `source`'s finished sync, when browse can filter its saved pages.
+pub fn local_pages(paths: &Paths, source: &Source) -> Result<Option<(Query, u64)>> {
+    let query = query_for(source);
+    let last_page = records(paths)?
+        .queries
+        .get(&query.key())
+        .filter(|record| record.state == "done")
+        .and_then(|record| record.last_page);
+    Ok(last_page.map(|last| (query, last)))
 }
 
 /// `status.sync`: the running record, or `null`.
@@ -156,7 +171,11 @@ pub fn sync(app: &App, key: &str) -> Result<Output> {
     let _lock = state::acquire_named_lock(&app.paths.state_dir, SYNC_LOCK, app.sync_lock_wait)?;
     let _ = fs::remove_file(app.paths.state(CANCEL_FILE));
     // The lock is ours, so any `running` record left behind belongs to a dead process.
-    let earlier = records(&app.paths)?.queries.remove(&query.key());
+    // A record from before `filters` starts over: its saved pages cannot be filtered.
+    let earlier = records(&app.paths)?
+        .queries
+        .remove(&query.key())
+        .filter(|record| record.filters);
     if let Some(done) = earlier.as_ref().filter(|record| record.state == "done") {
         return Ok(output(json!({"sync": done})));
     }
@@ -181,6 +200,7 @@ pub fn sync(app: &App, key: &str) -> Result<Output> {
             error: None,
             started_at: started,
             updated_at: started,
+            filters: true,
         },
         last_api: None,
     };
@@ -367,6 +387,7 @@ mod tests {
             error: None,
             started_at: 1,
             updated_at: 2,
+            filters: true,
         }
     }
 
@@ -577,5 +598,93 @@ mod tests {
             state::acquire_named_lock(&app.paths.state_dir, SYNC_LOCK, Duration::ZERO).unwrap();
         assert_eq!(run(&app, &["sync", "--cancel"]).unwrap()["running"], true);
         assert!(cancel_file.is_file());
+    }
+
+    #[test]
+    fn a_record_from_before_filters_is_walked_again() {
+        let t = Arc::new(two_pages());
+        let (app, _) = sync_app("sync-legacy", t.clone());
+        // A 0.3.3 record: done, but its saved pages lack category and colors.
+        let mut legacy = serde_json::to_value(record("done", 2, 4)).unwrap();
+        legacy.as_object_mut().unwrap().remove("filters");
+        let syncs = json!({"version": 1, "queries": {KEY: legacy}});
+        fs::create_dir_all(&app.paths.state_dir).unwrap();
+        fs::write(app.paths.state(SYNC_FILE), syncs.to_string()).unwrap();
+        assert_eq!(records(&app.paths).unwrap().queries[KEY].state, "stopped");
+
+        let sync = run(&app, &["sync", "landscape"]).unwrap()["sync"].clone();
+        assert_eq!((&sync["state"], &sync["done"]), (&json!("done"), &json!(4)));
+        assert_eq!(sync["filters"], true);
+        assert!(t.calls().contains(&page_url(1)));
+    }
+
+    #[test]
+    fn browse_filters_a_synced_category_without_wallhaven() {
+        let item = |id: &str, category: &str, colors: &[&str]| {
+            let mut v = item_json(id);
+            v["category"] = json!(category);
+            v["colors"] = json!(colors);
+            v
+        };
+        let page = |items: Vec<Value>| {
+            serde_json::to_vec(&json!({"data": items, "meta": {"last_page": 2, "total": 4}}))
+                .unwrap()
+        };
+        let t = FakeTransport::default();
+        t.add(
+            &page_url(1),
+            200,
+            page(vec![
+                item("aa1", "general", &["#66cccc"]),
+                item("aa2", "anime", &["#66cccc"]),
+            ]),
+        );
+        // aa2 moved down a page while the sync walked; it still counts once.
+        t.add(
+            &page_url(2),
+            200,
+            page(vec![
+                item("aa2", "anime", &["#66cccc"]),
+                item("bb1", "general", &["#000000"]),
+                item("bb2", "general", &["#000000", "#66cccc"]),
+            ]),
+        );
+        for id in ["aa1", "aa2", "bb1", "bb2"] {
+            t.add(&thumb_url(id), 200, PNG.to_vec());
+        }
+        let (mut app, _) = sync_app("sync-local-browse", t);
+        run(&app, &["sync", "landscape"]).unwrap();
+        // From here on every Wallhaven request fails.
+        let offline = Arc::new(FakeTransport::default());
+        app.transport = Box::new(offline.clone());
+        let ids = |out: &Output| -> Vec<String> {
+            out["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // The test settings show General only, any color.
+        let out = run(&app, &["browse", "landscape"]).unwrap();
+        assert_eq!(ids(&out), ["aa1", "bb1", "bb2"]);
+        assert_eq!((&out["total"], &out["lastPage"]), (&json!(3), &json!(1)));
+        assert_eq!(out["cached"], false);
+        assert!(out["items"][0]["thumb"].is_string());
+
+        let theme = &app.paths.theme_colors;
+        fs::create_dir_all(theme.parent().unwrap()).unwrap();
+        fs::write(theme, "accent = \"#66cccc\"\n").unwrap();
+        run(&app, &["set", "color", "theme"]).unwrap();
+        run(&app, &["set", "style.anime", "true"]).unwrap();
+        let out = run(&app, &["browse", "landscape"]).unwrap();
+        assert_eq!(ids(&out), ["aa1", "aa2", "bb2"]);
+        let totals = state::read_json::<crate::state::Status>(&app.paths.state("status.json"))
+            .unwrap()
+            .totals;
+        assert_eq!(totals["tag:711|cat:110|color:66cccc"], 3);
+        assert!(ids(&run(&app, &["browse", "landscape", "--page", "2"]).unwrap()).is_empty());
+        assert!(offline.calls().is_empty(), "{:?}", offline.calls());
     }
 }

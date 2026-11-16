@@ -156,6 +156,21 @@ pub struct Query {
 }
 
 impl Query {
+    /// Whether `item` passes this query's style and color filters, the way Wallhaven applies
+    /// them: `categories` is general/anime/people as 0/1, a color must be in the item's palette.
+    pub fn admits(&self, item: &Item) -> bool {
+        let style = match item.category.as_str() {
+            "general" => 0,
+            "anime" => 1,
+            "people" => 2,
+            _ => return false,
+        };
+        self.categories.as_bytes().get(style) == Some(&b'1')
+            && self
+                .color
+                .is_none_or(|hex| item.colors.iter().any(|c| c.strip_prefix('#') == Some(hex)))
+    }
+
     pub fn key(&self) -> String {
         format!(
             "tag:{}|cat:{}|color:{}",
@@ -187,6 +202,12 @@ pub struct Item {
     pub resolution: String,
     pub favorites: u64,
     pub file_size: u64,
+    /// `general`, `anime` or `people`; empty in pages saved before 0.3.4.
+    #[serde(default)]
+    pub category: String,
+    /// Palette as `#rrggbb`, which Wallhaven's color filter matches; empty before 0.3.4.
+    #[serde(default)]
+    pub colors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +232,10 @@ struct RawItem {
     file_size: u64,
     #[allow(dead_code)]
     file_type: String,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    colors: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -247,6 +272,8 @@ fn validate(raw: RawItem) -> Result<Item> {
         resolution: raw.resolution,
         favorites: raw.favorites,
         file_size: raw.file_size,
+        category: raw.category,
+        colors: raw.colors,
     })
 }
 
@@ -298,7 +325,7 @@ pub mod tests {
             "path": format!("https://w.wallhaven.cc/full/{p}/wallhaven-{id}.jpg"),
             "thumbs": {"large": format!("https://th.wallhaven.cc/lg/{p}/{id}.jpg"), "small": "x"},
             "resolution": "3840x2160", "favorites": 10, "file_size": 1000, "file_type": "image/jpeg",
-            "category": "general"
+            "category": "general", "colors": ["#424153", "#66cccc"]
         })
     }
 
@@ -329,6 +356,28 @@ pub mod tests {
         };
         assert_eq!(q.key(), "tag:37|cat:110|color:66cccc");
         assert!(q.url(1).ends_with("&page=1&colors=66cccc"));
+    }
+
+    #[test]
+    fn items_keep_style_and_colors_for_local_filters() {
+        let item = parse_search(&search_json(&["abc123"], 1, 1)).unwrap().items[0].clone();
+        assert_eq!(item.category, "general");
+        assert_eq!(item.colors, ["#424153", "#66cccc"]);
+        // Pages saved before 0.3.4 have neither field.
+        let legacy = r#"{"id":"abc123","full_url":"u","thumb_url":"t","resolution":"3840x2160","favorites":1,"file_size":1}"#;
+        let old: Item = serde_json::from_str(legacy).unwrap();
+        assert!(old.category.is_empty() && old.colors.is_empty());
+
+        let query = |categories, color| Query {
+            tag: 1,
+            categories,
+            color,
+        };
+        assert!(query("100", None).admits(&item));
+        assert!(!query("010", None).admits(&item));
+        assert!(query("110", Some("66cccc")).admits(&item));
+        assert!(!query("110", Some("000000")).admits(&item));
+        assert!(!query("111", None).admits(&old));
     }
 
     #[test]
