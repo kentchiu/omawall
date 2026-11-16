@@ -111,31 +111,24 @@ test('markup-shaped CLI text passes through as plain data', () => {
   assert.equal(M.sourceLabel({ sources: [{ key: 'x', label: '<b>x</b>' }] }, 'x'), '<b>x</b>');
 });
 
-test('sync control: progress while running, a check when done, resume otherwise', () => {
-  assert.equal(M.syncView(null, null, 'favs', status), null);
-  const idle = M.syncView(null, null, 'landscape', status);
-  assert.deepEqual([idle.icon, idle.text, idle.tooltip, idle.action], [M.Icons.sync, '', 'Sync all Landscape thumbnails', 'start']);
-  const running = { source: 'landscape', state: 'running', done: 1234, total: 4071, skipped: 0, updatedAt: 1794700000 };
-  const here = M.syncView(running, running, 'landscape', status);
-  assert.deepEqual([here.text, here.action, here.spinning, here.tooltip], ['Syncing 1,234 / 4,071', 'cancel', true, 'Cancel sync']);
-  assert.equal(M.syncView(running, null, 'city', status).text, 'Syncing Landscape 1,234 / 4,071');
-  assert.equal(M.syncView({ ...running, total: null, done: 0 }, null, 'landscape', status).text, 'Syncing 0 / …');
-  // Finished: a check, no action, and the date it finished.
-  const done = M.syncView(null, { ...running, state: 'done' }, 'landscape', status);
-  assert.deepEqual([done.icon, done.text, done.action], [M.Icons.synced, '', '']);
-  assert.match(done.tooltip, /^1,234 thumbnails synced on \d{4}-\d{2}-\d{2}$/);
-  const stopped = M.syncView(null, { ...running, state: 'stopped' }, 'landscape', status);
-  assert.deepEqual([stopped.text, stopped.action, stopped.tooltip], ['1,234 / 4,071', 'start', 'Sync stopped · click to resume']);
-  const failed = M.syncView(null, { ...running, state: 'failed', error: { code: 'network', message: 'No connection' } }, 'landscape', status);
-  assert.deepEqual([failed.icon, failed.tone, failed.tooltip], [M.Icons.syncAlert, 'error', 'Sync failed: No connection · click to resume']);
-});
-
-test('sync records come from the source entry for the current filters', () => {
-  const withSync = { ...status, sources: [{ ...status.sources[0], sync: { state: 'done', done: 3 } }, status.sources[1]] };
-  assert.equal(M.sourceSync(withSync, 'landscape').state, 'done');
-  assert.equal(M.sourceSync(withSync, 'space'), null);
-  assert.equal(M.sourceSync(null, 'landscape'), null);
-  assert.equal(M.formatDate(null), '');
+test('sync control covers every category: start, progress, resume, a check when all are done', () => {
+  const two = (landscape, city) => ({ ...status, sources: [
+    { key: 'landscape', label: 'Landscape', sync: landscape }, { key: 'city', label: 'City', sync: city }] });
+  assert.equal(M.syncView(null, { ...status, sources: [] }), null);
+  const idle = M.syncView(null, two(null, null));
+  assert.deepEqual([idle.icon, idle.text, idle.tooltip, idle.action], [M.Icons.sync, 'Sync all', 'Sync thumbnails of all 2 categories', 'start']);
+  const half = M.syncView(null, two({ state: 'done' }, { state: 'stopped', done: 1, total: 9 }));
+  assert.deepEqual([half.text, half.tooltip, half.action], ['Sync all · 1/2', 'Sync thumbnails of the remaining 1 of 2 categories', 'start']);
+  const running = { source: 'city', state: 'running', done: 1234, total: 4071 };
+  const busy = M.syncView(running, two({ state: 'done' }, running));
+  assert.deepEqual([busy.text, busy.action, busy.spinning, busy.tooltip], ['Syncing City · 2/2 · 1,234 / 4,071', 'cancel', true, 'Cancel sync']);
+  assert.equal(M.syncView({ ...running, total: null, done: 0 }, two(null, null)).text, 'Syncing City · 1/2 · 0 / …');
+  // All finished: a check and no action.
+  const done = M.syncView(null, two({ state: 'done' }, { state: 'done' }));
+  assert.deepEqual([done.icon, done.text, done.action, done.tooltip], [M.Icons.synced, '', '', 'All 2 categories synced']);
+  const failed = M.syncView(null, two({ state: 'done' }, { state: 'failed', error: { code: 'network', message: 'No connection' } }));
+  assert.deepEqual([failed.icon, failed.tone, failed.text, failed.action], [M.Icons.syncAlert, 'error', 'Sync all · 1/2', 'start']);
+  assert.equal(failed.tooltip, 'Sync failed: No connection · click to resume');
 });
 
 test('browse rows are flat and typed even for missing fields', () => {

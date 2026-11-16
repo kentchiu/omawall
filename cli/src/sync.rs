@@ -166,18 +166,44 @@ pub fn sync(app: &App, key: &str) -> Result<Output> {
         .iter()
         .find(|src| src.key == key)
         .ok_or_else(|| AppError::usage(format!("Unknown source: {key}")))?;
-    let query = query_for(source);
-
     let _lock = state::acquire_named_lock(&app.paths.state_dir, SYNC_LOCK, app.sync_lock_wait)?;
     let _ = fs::remove_file(app.paths.state(CANCEL_FILE));
+    let record = sync_source(app, source, &mut None)?;
+    Ok(output(json!({"sync": record})))
+}
+
+/// `sync --all`: every configured source in order under one lock. Finished ones are skipped;
+/// a cancel or a failure stops the run, and the next run resumes where it stopped.
+pub fn sync_all(app: &App) -> Result<Output> {
+    let sources = config::load_sources(&app.paths.config_file)?;
+    let _lock = state::acquire_named_lock(&app.paths.state_dir, SYNC_LOCK, app.sync_lock_wait)?;
+    let _ = fs::remove_file(app.paths.state(CANCEL_FILE));
+    // Pacing carries over from one source to the next.
+    let mut last_api = None;
+    let mut records = Vec::new();
+    for source in &sources {
+        let record = sync_source(app, source, &mut last_api)?;
+        let canceled = record.state == "canceled";
+        records.push(record);
+        if canceled {
+            break;
+        }
+    }
+    Ok(output(json!({"syncs": records})))
+}
+
+/// Syncs one source; the caller holds the sync lock. Returns its record, or the error after
+/// recording it as `failed`.
+fn sync_source(app: &App, source: &Source, last_api: &mut Option<Duration>) -> Result<SyncState> {
+    let query = query_for(source);
     // The lock is ours, so any `running` record left behind belongs to a dead process.
     // A record from before `filters` starts over: its saved pages cannot be filtered.
     let earlier = records(&app.paths)?
         .queries
         .remove(&query.key())
         .filter(|record| record.filters);
-    if let Some(done) = earlier.as_ref().filter(|record| record.state == "done") {
-        return Ok(output(json!({"sync": done})));
+    if let Some(done) = earlier.clone().filter(|record| record.state == "done") {
+        return Ok(done);
     }
     let started = now();
     let (page, done, skipped) = earlier.as_ref().map_or((1, 0, 0), |record| {
@@ -187,7 +213,7 @@ pub fn sync(app: &App, key: &str) -> Result<Output> {
         app,
         path: app.paths.state(SYNC_FILE),
         state: SyncState {
-            source: key.into(),
+            source: source.key.clone(),
             query_key: query.key(),
             state: "running".into(),
             done,
@@ -202,15 +228,16 @@ pub fn sync(app: &App, key: &str) -> Result<Output> {
             updated_at: started,
             filters: true,
         },
-        last_api: None,
+        last_api: *last_api,
     };
     let result = run.write().and_then(|()| run.walk(&query));
+    *last_api = run.last_api;
     cache::evict_thumbs(&app.paths.thumbs_dir(), cache::THUMBS_MAX_BYTES);
     match result {
         Ok(end) => {
             run.state.state = end.into();
             run.write()?;
-            Ok(output(json!({"sync": run.state})))
+            Ok(run.state)
         }
         Err(e) => {
             run.state.state = "failed".into();
@@ -686,5 +713,87 @@ mod tests {
         assert_eq!(totals["tag:711|cat:110|color:66cccc"], 3);
         assert!(ids(&run(&app, &["browse", "landscape", "--page", "2"]).unwrap()).is_empty());
         assert!(offline.calls().is_empty(), "{:?}", offline.calls());
+    }
+
+    fn city_url(page: u64) -> String {
+        Query {
+            tag: 17,
+            categories: "110",
+            color: None,
+        }
+        .url(page)
+    }
+
+    /// Two configured sources, landscape then city; city has one wallpaper, cc1.
+    fn landscape_and_city(app: &App, t: &FakeTransport) {
+        let config = json!({"sources": [
+            {"key": "landscape", "label": "Landscape", "tag": 711},
+            {"key": "city", "label": "City", "tag": 17}
+        ]});
+        fs::create_dir_all(app.paths.config_file.parent().unwrap()).unwrap();
+        fs::write(&app.paths.config_file, config.to_string()).unwrap();
+        t.add(&city_url(1), 200, search_json(&["cc1"], 1, 1));
+        t.add(&thumb_url("cc1"), 200, PNG.to_vec());
+    }
+
+    fn states(out: &Output) -> Vec<(String, String)> {
+        out["syncs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let field = |k: &str| r[k].as_str().unwrap().to_string();
+                (field("source"), field("state"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sync_all_walks_every_category_once() {
+        let t = Arc::new(two_pages());
+        let (app, _) = sync_app("sync-all", t.clone());
+        landscape_and_city(&app, &t);
+        let out = run(&app, &["sync", "--all"]).unwrap();
+        let both = [
+            ("landscape".to_string(), "done".to_string()),
+            ("city".to_string(), "done".to_string()),
+        ];
+        assert_eq!(states(&out), both);
+        assert_eq!(out["syncs"][1]["done"], 1);
+        // Finished categories are skipped without asking Wallhaven anything.
+        let calls = t.calls().len();
+        assert_eq!(states(&run(&app, &["sync", "--all"]).unwrap()), both);
+        assert_eq!(t.calls().len(), calls);
+    }
+
+    #[test]
+    fn sync_all_stops_at_a_failed_or_canceled_category() {
+        let t = Arc::new(FakeTransport::default());
+        t.add(&page_url(1), 500, Vec::new());
+        let (app, _) = sync_app("sync-all-failed", t.clone());
+        landscape_and_city(&app, &t);
+        assert_eq!(
+            run(&app, &["sync", "--all"]).unwrap_err().code,
+            "unavailable"
+        );
+        assert!(!t.calls().contains(&city_url(1)));
+        assert_eq!(sync_file(&app).state, "failed");
+
+        let (mut app, _) = sync_app("sync-all-canceled", FakeTransport::default());
+        let inner = two_pages();
+        landscape_and_city(&app, &inner);
+        fs::create_dir_all(&app.paths.state_dir).unwrap();
+        let cancel = app.paths.state(CANCEL_FILE);
+        app.transport = Box::new(CancelAt {
+            inner,
+            url: thumb_url("aa1"),
+            cancel,
+        });
+        let out = run(&app, &["sync", "--all"]).unwrap();
+        assert_eq!(
+            states(&out),
+            [("landscape".to_string(), "canceled".to_string())]
+        );
+        assert!(!app.paths.thumbs_dir().join("cc1.png").exists());
     }
 }

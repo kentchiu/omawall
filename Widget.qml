@@ -56,8 +56,7 @@ Panel {
   readonly property bool timerEnabled: !!(userSettings.timer && userSettings.timer.enabled)
   readonly property int timerMinutes: Model.clampMinutes(userSettings.timer ? userSettings.timer.minutes : 60)
   readonly property bool busy: actionProc.running
-  readonly property var syncInfo: Model.syncView(status && status.sync ? status.sync : null,
-                                                 Model.sourceSync(status, browseSource), browseSource, status)
+  readonly property var syncInfo: Model.syncView(status && status.sync ? status.sync : null, status)
 
   implicitWidth: barButton.implicitWidth
   implicitHeight: barButton.implicitHeight
@@ -203,10 +202,11 @@ Panel {
     runAction(["apply", id])
   }
   // Sync outlives the panel and the browse view; progress comes back through syncs.json.
+  // It covers every category, whichever tab is open.
   function syncAction() {
     if (!syncInfo) return
     if (syncInfo.action === "cancel") runAction(["sync", "--cancel"])
-    else if (syncInfo.action === "start") Quickshell.execDetached([root.commandPath, "sync", browseSource])
+    else if (syncInfo.action === "start") Quickshell.execDetached([root.commandPath, "sync", "--all"])
   }
 
   onOpenedChanged: if (opened) refreshStatus()
@@ -799,7 +799,7 @@ Panel {
               wrapMode: Text.NoWrap
             }
             Button {
-              visible: root.syncInfo !== null && root.browseLastPage > 0
+              visible: root.syncInfo !== null
               iconText: root.syncInfo ? root.syncInfo.icon : ""
               iconSpinning: root.syncInfo !== null && root.syncInfo.spinning
               text: root.syncInfo ? root.syncInfo.text : ""

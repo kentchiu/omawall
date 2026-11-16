@@ -53,6 +53,7 @@ pub enum Command {
         value: String,
     },
     Sync(String),
+    SyncAll,
     SyncCancel,
 }
 
@@ -73,7 +74,7 @@ impl Command {
     }
 }
 
-const USAGE: &str = "Usage: omawall status | next [--trigger manual|timer] | apply <id> [--trigger manual] | fav [<id>] | browse <source|favs> [--page N] | set <name> <value> | sync <source> | sync --cancel | --version";
+const USAGE: &str = "Usage: omawall status | next [--trigger manual|timer] | apply <id> [--trigger manual] | fav [<id>] | browse <source|favs> [--page N] | set <name> <value> | sync <source> | sync --all | sync --cancel | --version";
 
 fn usage() -> AppError {
     AppError::usage(USAGE)
@@ -120,6 +121,7 @@ pub fn parse_args(args: &[String]) -> Result<Command> {
             value: value.to_string(),
         },
         ["sync", "--cancel"] => Command::SyncCancel,
+        ["sync", "--all"] => Command::SyncAll,
         ["sync", source] => Command::Sync(source.to_string()),
         _ => return Err(usage()),
     };
@@ -204,6 +206,7 @@ impl App {
         match command {
             Command::Status => return self.status(),
             Command::Sync(key) => return sync::sync(self, &key),
+            Command::SyncAll => return sync::sync_all(self),
             Command::SyncCancel => return sync::cancel(&self.paths),
             _ => {}
         }
@@ -235,7 +238,7 @@ impl App {
             Command::Fav(id) => self.fav(id.as_deref()),
             Command::Browse { source, page } => self.browse(&source, page),
             Command::Set { name, value } => self.set(&name, &value),
-            Command::Status | Command::Sync(_) | Command::SyncCancel => {
+            Command::Status | Command::Sync(_) | Command::SyncAll | Command::SyncCancel => {
                 unreachable!("handled in run")
             }
         }
@@ -794,6 +797,10 @@ pub mod tests {
         assert_eq!(
             parse_args(&args(&["sync", "--cancel"])).unwrap(),
             Command::SyncCancel
+        );
+        assert_eq!(
+            parse_args(&args(&["sync", "--all"])).unwrap(),
+            Command::SyncAll
         );
         for bad in [
             &[][..],

@@ -13,12 +13,13 @@ optional timer. No API key is needed.
 - Browse every source in a grid and click a thumbnail to apply it. Right-click a thumbnail to add it to
   favorites or open it on Wallhaven. The next page loads in the
   background while you look at the current one.
-- Sync all thumbnails of a source to disk with the sync icon next to the page counter in the browse view,
-  so its pages no longer wait for downloads. It runs in the background; click the icon again to cancel.
+- Sync the thumbnails of every source to disk with Sync all, next to the page counter in the browse view.
+  It runs in the background, one category after another; click it again to cancel, and the next run
+  resumes where it stopped. Finished categories are skipped, so after adding a tag to `config.json` it only
+  syncs the new one. A check mark means every category is synced.
   A sync covers the whole category: afterwards browsing that source reads from disk for any style or color
   and never calls Wallhaven, so it cannot hit the rate limit. Wallpapers uploaded after the sync do not show
-  there. A finished source keeps a check mark and a stopped one resumes where it left off. Sources synced
-  before 0.3.4 show as stopped; sync them again to browse them offline.
+  there. Categories synced before 0.3.4 count as not synced; Sync all walks them again.
 - Open the thumbnails folder in your file manager with the folder icon next to it.
 - Favorite a wallpaper to keep a copy in `~/Pictures/Wallpapers/wallhaven/`.
 - An applied wallpaper is not picked again until its source has been shown in full.
@@ -60,7 +61,7 @@ optional timer. No API key is needed.
 | `f` | Add it to favorites, or remove it |
 | `o` | Open its Wallhaven page |
 | `Tab` / `Shift+Tab` | Next / previous category |
-| `s` | Start or cancel syncing this category |
+| `s` | Start or cancel syncing all categories |
 | `Esc` / `q` | Close |
 
 ## Update

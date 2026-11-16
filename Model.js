@@ -189,48 +189,37 @@ function banner(cliState, status, pluginVersion) {
   return { tone: outage ? "warn" : "error", text: err.message }
 }
 
-// Local date of a Unix time in seconds, as YYYY-MM-DD.
-function formatDate(seconds) {
-  if (typeof seconds !== "number" || !isFinite(seconds) || seconds <= 0) return ""
-  var d = new Date(seconds * 1000)
-  var pad = function(n) { return (n < 10 ? "0" : "") + n }
-  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
-}
-
-// The sync record of a source for the current filters, or null.
-function sourceSync(status, key) {
+// The one sync control in the browse view, covering every tag source. `running` is the sync in
+// progress, if any; `status.sources[].sync` holds each category's record. A finished run has no
+// action: finished categories are never walked again.
+function syncView(running, status) {
   var sources = status && status.sources ? status.sources : []
-  for (var i = 0; i < sources.length; i++) if (sources[i].key === key) return sources[i].sync || null
-  return null
-}
-
-// Sync control next to the page counter in the browse view, for a tag source.
-// `running` is the sync in progress anywhere (only one runs at a time, so it offers Cancel on
-// every tab); `record` is this source's own result. A finished source has no action: its new
-// wallpapers get thumbnails when browsed.
-function syncView(running, record, key, status) {
-  if (!key || key === FAVS) return null
-  var label = function(k) { return sourceLabel(status, k) || k }
-  var progress = function(r) { return formatCount(r.done) + " / " + (typeof r.total === "number" ? formatCount(r.total) : "…") }
-  var view = { icon: Icons.sync, text: "", tooltip: "Sync all " + label(key) + " thumbnails", action: "start", tone: "normal", spinning: false }
+  if (!sources.length) return null
+  var total = sources.length
+  var synced = 0
+  var failed = null
+  for (var i = 0; i < sources.length; i++) {
+    var record = sources[i].sync
+    if (record && record.state === "done") synced++
+    else if (record && record.state === "failed") failed = record
+  }
+  var view = { icon: Icons.sync, text: synced ? "Sync all · " + synced + "/" + total : "Sync all", action: "start", tone: "normal", spinning: false,
+               tooltip: "Sync thumbnails of " + (synced ? "the remaining " + (total - synced) + " of " : "all ") + total + " categories" }
   if (running) {
-    var here = running.source === key
-    view.text = "Syncing " + (here ? "" : label(running.source) + " ") + progress(running)
-    view.tooltip = here ? "Cancel sync" : "Cancel " + label(running.source) + " sync"
+    var progress = formatCount(running.done) + " / " + (typeof running.total === "number" ? formatCount(running.total) : "…")
+    view.text = "Syncing " + (sourceLabel(status, running.source) || running.source) + " · " + Math.min(total, synced + 1) + "/" + total + " · " + progress
+    view.tooltip = "Cancel sync"
     view.action = "cancel"
     view.spinning = true
-  } else if (record && record.state === "done") {
+  } else if (synced === total) {
     view.icon = Icons.synced
-    view.tooltip = formatCount(record.done) + " thumbnails synced" + (formatDate(record.updatedAt) ? " on " + formatDate(record.updatedAt) : "")
+    view.text = ""
+    view.tooltip = "All " + total + " categories synced"
     view.action = ""
-  } else if (record && record.state === "failed") {
+  } else if (failed) {
     view.icon = Icons.syncAlert
     view.tone = "error"
-    view.text = progress(record)
-    view.tooltip = "Sync failed: " + (record.error && typeof record.error.message === "string" ? record.error.message : "unknown error") + " · click to resume"
-  } else if (record && (record.state === "canceled" || record.state === "stopped")) {
-    view.text = progress(record)
-    view.tooltip = "Sync stopped · click to resume"
+    view.tooltip = "Sync failed: " + (failed.error && typeof failed.error.message === "string" ? failed.error.message : "unknown error") + " · click to resume"
   }
   return view
 }

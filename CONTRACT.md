@@ -116,13 +116,16 @@ Error codes: `usage`, `config`, `network`, `timeout`, `rate_limited` (HTTP 429),
 | `omawall set <name> <value>` | no | `{ok, settings}`; names: `sources` (comma list, may be empty, may include `favs`), `style.general`, `style.anime` (`true`/`false`), `color` (`none`/`theme`), `timer.enabled` (`true`/`false`), `timer.minutes` (integer 5–1440) |
 
 | `omawall sync <sourceKey>` | yes | long-running: downloads every thumbnail of that tag source (whole category, any filters); progress in `syncs.json`; prints `{ok, sync}` when it ends as `done` or `canceled`, the failure envelope when `failed` |
+| `omawall sync --all` | yes | long-running: `sync` for every configured source in config order under one lock; finished ones return their record with no network; stops after a `canceled` one; prints `{ok, syncs: [record, ...]}` for the sources it reached, the failure envelope at the first `failed` one |
 | `omawall sync --cancel` | no | asks a running sync to stop; `{ok, running: bool}` (whether a sync was running) |
 
 \* `fav` may download the current thumbnail if missing; `fav <id>` downloads that wallpaper and its thumbnail.
 
 ### `sync`
 
-The plugin starts it detached (`Quickshell.execDetached`), so it outlives the panel and the browse view.
+The plugin starts `sync --all` detached (`Quickshell.execDetached`), so it outlives the panel and the browse view.
+`sync --all` runs the steps below for each source in turn, keeps the 2 s API pacing across sources, and stops at
+the first canceled or failed one; the next run resumes there, since finished sources are skipped.
 
 1. `favs` or an unknown key → `usage` (checked first). Take `<state>/sync.lock` (wait up to 2 s; held → `busy`).
    Never hold `<state>/lock` while syncing, so `next`, `browse`, `fav` and `set` keep working. Delete a stale
