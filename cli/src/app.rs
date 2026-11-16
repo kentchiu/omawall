@@ -42,9 +42,16 @@ pub enum Command {
     Status,
     Next(Trigger),
     Apply(String),
-    Fav,
-    Browse { source: String, page: u64 },
-    Set { name: String, value: String },
+    /// `fav` toggles the current wallpaper; `fav <id>` any wallpaper.
+    Fav(Option<String>),
+    Browse {
+        source: String,
+        page: u64,
+    },
+    Set {
+        name: String,
+        value: String,
+    },
     Sync(String),
     SyncCancel,
 }
@@ -61,12 +68,12 @@ impl Command {
     fn notifies(&self) -> bool {
         !matches!(
             self,
-            Command::Browse { .. } | Command::Fav | Command::Set { .. } | Command::Status
+            Command::Browse { .. } | Command::Fav(_) | Command::Set { .. } | Command::Status
         )
     }
 }
 
-const USAGE: &str = "Usage: omawall status | next [--trigger manual|timer] | apply <id> [--trigger manual] | fav | browse <source|favs> [--page N] | set <name> <value> | sync <source> | sync --cancel | --version";
+const USAGE: &str = "Usage: omawall status | next [--trigger manual|timer] | apply <id> [--trigger manual] | fav [<id>] | browse <source|favs> [--page N] | set <name> <value> | sync <source> | sync --cancel | --version";
 
 fn usage() -> AppError {
     AppError::usage(USAGE)
@@ -89,7 +96,13 @@ pub fn parse_args(args: &[String]) -> Result<Command> {
             }
             Command::Apply(id.to_string())
         }
-        ["fav"] => Command::Fav,
+        ["fav"] => Command::Fav(None),
+        ["fav", id] => {
+            if !wallhaven::is_valid_id(id) {
+                return Err(AppError::usage(format!("Invalid wallpaper id: {id}")));
+            }
+            Command::Fav(Some(id.to_string()))
+        }
         ["browse", source] => Command::Browse {
             source: source.to_string(),
             page: 1,
@@ -219,7 +232,7 @@ impl App {
         match command {
             Command::Next(_) => self.next(),
             Command::Apply(id) => self.apply(&id),
-            Command::Fav => self.fav(),
+            Command::Fav(id) => self.fav(id.as_deref()),
             Command::Browse { source, page } => self.browse(&source, page),
             Command::Set { name, value } => self.set(&name, &value),
             Command::Status | Command::Sync(_) | Command::SyncCancel => {
@@ -340,16 +353,23 @@ impl App {
         self.finish_apply(&mut s.status, applied)
     }
 
-    fn fav(&self) -> Result<Output> {
+    fn fav(&self, id: Option<&str>) -> Result<Output> {
         let mut s = self.load()?;
-        let cur = s.status.current.clone().ok_or_else(no_current)?;
-        if !wallhaven::is_valid_id(&cur.id) {
-            return Err(AppError::new("io", "Invalid wallpaper id in status.json"));
-        }
-        let favorite = if s.favorites.contains(&cur.id) {
-            self.remove_favorite(&cur.id, &mut s.favorites, &mut s.status)?;
+        let current = s.status.current.clone();
+        let id = match id {
+            Some(id) => id.to_string(),
+            None => {
+                let cur = current.as_ref().ok_or_else(no_current)?;
+                if !wallhaven::is_valid_id(&cur.id) {
+                    return Err(AppError::new("io", "Invalid wallpaper id in status.json"));
+                }
+                cur.id.clone()
+            }
+        };
+        let favorite = if s.favorites.contains(&id) {
+            self.remove_favorite(&id, &mut s.favorites, &mut s.status)?;
             false
-        } else {
+        } else if let Some(cur) = current.filter(|c| c.id == id) {
             let src = Path::new(&cur.path);
             if !src.is_file() {
                 return Err(AppError::new(
@@ -384,12 +404,32 @@ impl App {
                 },
             );
             true
+        } else {
+            let fav = self.download_favorite(&id)?;
+            s.favorites.items.insert(0, fav);
+            true
         };
         self.save(&s.favorites, "favorites.json")?;
         self.write_status(&mut s.status)?;
         Ok(output(
-            json!({"favorite": favorite, "current": s.status.current}),
+            json!({"id": id, "favorite": favorite, "current": s.status.current}),
         ))
+    }
+
+    /// Downloads a wallpaper that is not on the desktop straight into the favorites folder.
+    fn download_favorite(&self, id: &str) -> Result<Favorite> {
+        let item = pages::detail(&*self.transport, &*self.clock, &self.paths.pages_dir(), id)?;
+        let path = image::ensure_full(&*self.transport, &item, &self.paths.favorites_dir)?;
+        let thumb = image::ensure_thumb(&*self.transport, &item, &self.paths.thumbs_dir()).ok();
+        Ok(Favorite {
+            id: item.id,
+            path: path.display().to_string(),
+            thumb: thumb.map(|p| p.display().to_string()),
+            resolution: item.resolution,
+            favorites: item.favorites,
+            file_size: item.file_size,
+            added_at: now(),
+        })
     }
 
     fn browse(&self, key: &str, page: u64) -> Result<Output> {
@@ -913,6 +953,38 @@ pub mod tests {
         assert_eq!(
             fs::read_to_string(&legacy).unwrap(),
             r#"{"version":1,"ids":["aa1"]}"#
+        );
+    }
+
+    #[test]
+    fn fav_by_id_saves_without_applying() {
+        let app = test_app("app-fav-id", landscape(&["aa1", "aa2"]));
+        run(&app, &["set", "sources", "landscape"]).unwrap();
+        // No wallpaper applied yet; an id still works.
+        let out = run(&app, &["fav", "aa2"]).unwrap();
+        assert_eq!(
+            (&out["id"], &out["favorite"]),
+            (&json!("aa2"), &json!(true))
+        );
+        assert!(out["current"].is_null());
+        let fav_file = app.paths.favorites_dir.join("wallhaven-aa2.jpg");
+        assert!(fav_file.is_file());
+        let favorites: Favorites = state::read_json(&app.paths.state("favorites.json")).unwrap();
+        assert_eq!(favorites.items[0].id, "aa2");
+        assert!(favorites.items[0].thumb.is_some());
+
+        // Favoriting another wallpaper leaves the current one alone.
+        assert_eq!(run(&app, &["next"]).unwrap()["current"]["id"], "aa1");
+        assert_eq!(run(&app, &["fav", "aa2"]).unwrap()["favorite"], false);
+        assert!(!fav_file.exists());
+        assert_eq!(status_of(&app).current.unwrap().id, "aa1");
+
+        // The current id behaves like plain `fav`.
+        assert_eq!(run(&app, &["fav", "aa1"]).unwrap()["favorite"], true);
+        assert!(app.paths.favorites_dir.join("wallhaven-aa1.jpg").is_file());
+        assert_eq!(
+            parse_args(&args(&["fav", "../x"])).unwrap_err().code,
+            "usage"
         );
     }
 

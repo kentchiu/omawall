@@ -10,7 +10,8 @@ optional timer. No API key is needed.
 - Pick any mix of sources: 10 Wallhaven tags (landscape, nature, space, city, mountains,
   architecture, minimalism, abstract, digital art, cars) plus your local favorites.
 - Filter by style (General / Anime) and optionally by the current theme's accent color.
-- Browse every source in a grid and click a thumbnail to apply it. The next page loads in the
+- Browse every source in a grid and click a thumbnail to apply it. Right-click a thumbnail to add it to
+  favorites or open it on Wallhaven. The next page loads in the
   background while you look at the current one.
 - Sync all thumbnails of a source to disk with the sync icon next to the page counter in the browse view,
   so its pages no longer wait for downloads. It runs in the background; click the icon again to cancel.
@@ -54,6 +55,7 @@ optional timer. No API key is needed.
 | `PageUp` / `PageDown` | Move one screen |
 | `Home` / `End` (or `g` / `G`) | First / last wallpaper |
 | `Enter` | Apply the selected wallpaper |
+| `f` | Add it to favorites, or remove it |
 | `o` | Open its Wallhaven page |
 | `Tab` / `Shift+Tab` | Next / previous category |
 | `s` | Start or cancel syncing this category |

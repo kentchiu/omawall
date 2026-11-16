@@ -111,14 +111,14 @@ Error codes: `usage`, `config`, `network`, `timeout`, `rate_limited` (HTTP 429),
 | `omawall status` | no | `{ok, version, status, settings, sources: [{key, label, tag, selected, total, sync}], favorites: {count, selected}, sync}` — `total` from `status.totals` for the current filters, else `null`; `sync` fields see below |
 | `omawall next [--trigger manual\|timer]` | yes | applies the next wallpaper; `{ok, current}` |
 | `omawall apply <id> [--trigger manual]` | yes | downloads and applies that id; `{ok, current}` |
-| `omawall fav` | no* | toggles favorite for current; `{ok, favorite: bool, current}` |
+| `omawall fav [<id>]` | no* | toggles favorite for `<id>` (default: current) without applying it; a non-current id is downloaded straight into the favorites dir; `{ok, id, favorite: bool, current}` |
 | `omawall browse <sourceKey\|favs> [--page N]` | yes | `{ok, source, page, lastPage, total, items: [{id, thumb, resolution, favorites, fileSize, seen, favorite, current}], cached}`, 24 per page, thumbnails downloaded first; `cached` is true when the page came from disk; a thumbnail that cannot be fetched is `null` (only `io` fails the page) |
 | `omawall set <name> <value>` | no | `{ok, settings}`; names: `sources` (comma list, may be empty, may include `favs`), `style.general`, `style.anime` (`true`/`false`), `color` (`none`/`theme`), `timer.enabled` (`true`/`false`), `timer.minutes` (integer 5–1440) |
 
 | `omawall sync <sourceKey>` | yes | long-running: downloads every thumbnail of that tag source (whole category, any filters); progress in `syncs.json`; prints `{ok, sync}` when it ends as `done` or `canceled`, the failure envelope when `failed` |
 | `omawall sync --cancel` | no | asks a running sync to stop; `{ok, running: bool}` (whether a sync was running) |
 
-\* `fav` may download the current thumbnail if missing.
+\* `fav` may download the current thumbnail if missing; `fav <id>` downloads that wallpaper and its thumbnail.
 
 ### `sync`
 

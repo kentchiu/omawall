@@ -40,6 +40,8 @@ Panel {
   property var loadedPages: ({})
   // The card the keyboard acts on.
   property int selectedIndex: 0
+  // Wallpaper whose favorite toggle is running from the browse view.
+  property string favBusyId: ""
   readonly property bool browseBusy: browseProc.running
   // Repeaters rebuild every delegate when handed a new array; these change only when their content does.
   property var sources: []
@@ -75,6 +77,7 @@ Panel {
   // The grid holds a card for every wallpaper of the source, so the scrollbar spans all of it;
   // pages fill in around wherever the view is, one CLI call at a time.
   function loadBrowse(key) {
+    cardMenu.close()
     wheelGlide.stop()
     browseModel.clear()
     browseSource = key
@@ -125,7 +128,10 @@ Panel {
     loadBrowse(Model.firstBrowseKey(status))
     Qt.callLater(function() { browseScope.forceActiveFocus() })
   }
-  function closeBrowse() { browseOpen = false }
+  function closeBrowse() {
+    cardMenu.close()
+    browseOpen = false
+  }
   function markLoaded(page) {
     var pages = loadedPages
     pages[page] = true
@@ -162,6 +168,10 @@ Panel {
     loadBrowse(tabs[(at + step + tabs.length) % tabs.length].key)
   }
   function browseKey(event) {
+    if (cardMenu.wid !== "") {
+      cardMenu.close()
+      if (event.key === Qt.Key_Escape) { event.accepted = true; return }
+    }
     switch (event.key) {
     case Qt.Key_Left: case Qt.Key_H: selectMove("left"); break
     case Qt.Key_Right: case Qt.Key_L: selectMove("right"); break
@@ -174,6 +184,7 @@ Panel {
     case Qt.Key_G: selectMove(event.modifiers & Qt.ShiftModifier ? "end" : "home"); break
     case Qt.Key_Return: case Qt.Key_Enter: if (selectedWallpaper()) applyFromBrowse(selectedWallpaper()); break
     case Qt.Key_O: openUrl(Model.wallpaperUrl(selectedWallpaper())); break
+    case Qt.Key_F: favoriteFromBrowse(selectedWallpaper()); break
     case Qt.Key_Tab: switchTab(1); break
     case Qt.Key_Backtab: switchTab(-1); break
     case Qt.Key_S: syncAction(); break
@@ -181,6 +192,11 @@ Panel {
     default: event.accepted = false; return
     }
     event.accepted = true
+  }
+  function favoriteFromBrowse(id) {
+    if (!id || busy) return
+    favBusyId = id
+    runAction(["fav", id])
   }
   function applyFromBrowse(id) {
     closeBrowse()
@@ -277,6 +293,7 @@ Panel {
       exitSeen = true
       var result = Model.parseResult(actionOut.text)
       if (!result.ok) root.actionError = result.error.message
+      root.favBusyId = ""
       root.refreshStatus()
       favoritesFile.reload()
     }
@@ -697,7 +714,6 @@ Panel {
               required property real favs
               required property real size
               required property bool seen
-              required property bool fav
               required property bool current
               required property int index
               readonly property bool picked: index === root.selectedIndex
@@ -747,7 +763,8 @@ Panel {
                   spacing: Style.space(6)
                   Badge { visible: card.current; text: "Current"; strong: true }
                   Badge { visible: card.seen && !card.current; text: "Seen" }
-                  Badge { visible: card.fav; text: "Favorite" }
+                  Badge { visible: card.wid !== "" && root.favBusyId === card.wid; text: root.favoriteIds[card.wid] === true ? "Removing…" : "Saving…" }
+                  Badge { visible: root.favoriteIds[card.wid] === true && root.favBusyId !== card.wid; text: "Favorite" }
                 }
                 MouseArea {
                   id: mouse
@@ -755,7 +772,13 @@ Panel {
                   enabled: card.wid !== ""
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: root.applyFromBrowse(card.wid)
+                  acceptedButtons: Qt.LeftButton | Qt.RightButton
+                  onClicked: function(event) {
+                    if (event.button !== Qt.RightButton) { root.applyFromBrowse(card.wid); return }
+                    root.selectedIndex = card.index
+                    var at = mouse.mapToItem(browsePanel, event.x, event.y)
+                    cardMenu.openAt(card.wid, at.x, at.y)
+                  }
                 }
                 Accessible.role: Accessible.Button
                 Accessible.name: "Apply " + card.wid
@@ -798,10 +821,11 @@ Panel {
               onClicked: Util.execArgv(["xdg-open", root.thumbsDir])
             }
             Label {
-              visible: root.browsePageError !== "" || root.browseOffline
-              text: root.browsePageError !== "" ? "Some pages could not load: " + root.browsePageError
+              visible: root.actionError !== "" || root.browsePageError !== "" || root.browseOffline
+              text: root.actionError !== "" ? root.actionError
+                : root.browsePageError !== "" ? "Some pages could not load: " + root.browsePageError
                 : "Wallhaven unreachable · showing saved pages"
-              color: root.browsePageError !== "" ? Color.urgent : Color.accent
+              color: root.actionError !== "" || root.browsePageError !== "" ? Color.urgent : Color.accent
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.NoWrap
               elide: Text.ElideRight
@@ -809,11 +833,64 @@ Panel {
             }
             Item { Layout.fillWidth: true }
             Label {
-              text: "←↑↓→ / hjkl move · Enter apply · o open · Tab category · s sync · Esc close"
+              text: "←↑↓→ / hjkl move · Enter apply · f favorite · o open · right-click menu · Tab category · s sync · Esc close"
               color: Qt.darker(Color.foreground, 1.6)
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.NoWrap
             }
+          }
+        }
+      }
+
+      // While the card menu is open, a click or wheel anywhere else in the panel only closes it.
+      MouseArea {
+        anchors.fill: parent
+        visible: cardMenu.wid !== ""
+        acceptedButtons: Qt.AllButtons
+        onPressed: cardMenu.close()
+        onWheel: cardMenu.close()
+      }
+
+      Rectangle {
+        id: cardMenu
+        property string wid: ""
+        readonly property bool isFav: root.favoriteIds[wid] === true
+        readonly property real itemWidth: Math.max(favItem.implicitWidth, openItem.implicitWidth)
+        function openAt(id, px, py) {
+          wid = id
+          x = Math.max(0, Math.min(px, browsePanel.width - width))
+          y = Math.max(0, Math.min(py, browsePanel.height - height))
+        }
+        function close() { wid = "" }
+        visible: wid !== ""
+        width: menuColumn.implicitWidth + Style.space(12)
+        height: menuColumn.implicitHeight + Style.space(12)
+        color: Color.popups.background
+        border.color: Color.popups.border
+        border.width: Math.max(1, Style.space(2))
+        radius: Style.cornerRadius
+
+        Column {
+          id: menuColumn
+          anchors.centerIn: parent
+          Button {
+            id: favItem
+            width: cardMenu.itemWidth
+            leftAlign: true
+            text: cardMenu.isFav ? "Remove from favorites" : "Add to favorites"
+            enabled: !root.busy
+            Accessible.role: Accessible.MenuItem
+            Accessible.name: text
+            onClicked: { root.favoriteFromBrowse(cardMenu.wid); cardMenu.close() }
+          }
+          Button {
+            id: openItem
+            width: cardMenu.itemWidth
+            leftAlign: true
+            text: "Open in Wallhaven"
+            Accessible.role: Accessible.MenuItem
+            Accessible.name: text
+            onClicked: { root.openUrl(Model.wallpaperUrl(cardMenu.wid)); cardMenu.close() }
           }
         }
       }
